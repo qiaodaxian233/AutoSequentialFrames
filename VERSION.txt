@@ -1,0 +1,7 @@
+版本: v3-overlay-mode
+日期: 2026-05-01
+特性: 覆盖式上传模式 (不修改 LoadImage 的 widget 值)
+关键改动:
+  - 后端新增 /auto_sequential/inject 接口 (shutil.copyfile)
+  - 前端不再调用 setWidgetValue 改 LoadImage
+  - 通过覆盖 input/<占位文件名> 的内容实现切图
