@@ -5,6 +5,13 @@ ComfyUI-AutoSequentialFrames
 自动顺序读取目录里的图片，输出相邻两张作为「首帧 / 尾帧」。
 搭配前端 JS：执行成功后 current_index += step，并自动队列下一次，
 从而实现 (img1,img2) → (img2,img3) → (img3,img4) ... 的连续视频链。
+
+v4 新增「尾帧模式」(tail_frame_mode)：
+    生成完一段视频后，自动从 ComfyUI/output/ 里找最新的、分辨率匹配的视频
+    （默认 1920x1088，用来过滤掉中间预览/低分辨率版本），抽出它的最后一帧
+    作为下一段视频的「首帧」。这样一段段视频接力时画面真正连续，不会因为
+    模型生成的尾帧和目录里的目标关键帧之间存在差异而出现跳变。
+    「尾帧」目标仍然按目录顺序往后取，目录起到「目标关键帧」的作用。
 """
 
 import os
@@ -77,6 +84,151 @@ def _load_image_tensor(path: str) -> torch.Tensor:
         img = img.convert("RGB")
     arr = np.array(img).astype(np.float32) / 255.0
     return torch.from_numpy(arr)[None, ]
+
+
+# ---------- 视频工具函数 (尾帧模式用) ----------
+
+VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v")
+
+
+def _parse_resolution(s: str):
+    """把 '1920x1088' / '1920*1088' / '1920×1088' 解析为 (1920, 1088)。失败返回 (0,0)。"""
+    if not s:
+        return (0, 0)
+    txt = s.lower().replace("*", "x").replace("×", "x").replace(" ", "")
+    parts = txt.split("x")
+    if len(parts) != 2:
+        return (0, 0)
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return (0, 0)
+
+
+def _scan_videos(output_dir: str, since_mtime: float = 0.0):
+    """
+    扫描 output_dir（递归）下所有视频文件，返回 [(path, mtime), ...]，
+    只保留 mtime >= since_mtime 的，按 mtime 从新到旧排好序。
+    """
+    if not output_dir or not os.path.isdir(output_dir):
+        return []
+
+    items = []
+    try:
+        for root, _dirs, files in os.walk(output_dir):
+            for fname in files:
+                if not fname.lower().endswith(VIDEO_EXTENSIONS):
+                    continue
+                full = os.path.join(root, fname)
+                try:
+                    m = os.path.getmtime(full)
+                except OSError:
+                    continue
+                if m + 1e-3 < since_mtime:  # 容忍一点 mtime 精度差
+                    continue
+                items.append((full, m))
+    except OSError:
+        return []
+
+    items.sort(key=lambda x: x[1], reverse=True)
+    return items
+
+
+def _get_video_resolution(video_path: str):
+    """返回视频的 (width, height)。打不开就返 (0, 0)。"""
+    try:
+        import cv2
+    except ImportError:
+        return (0, 0)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return (0, 0)
+    try:
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        return (w, h)
+    finally:
+        cap.release()
+
+
+def _extract_video_last_frame(video_path: str, dst_path: str):
+    """
+    把视频的最后一帧写成图片文件 (dst_path 推荐用 .jpg/.png)。
+    返回 (width, height)。
+    """
+    try:
+        import cv2
+    except ImportError:
+        raise RuntimeError(
+            "尾帧模式需要 opencv-python。请在 ComfyUI 环境里执行: "
+            "pip install opencv-python"
+        )
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开视频: {video_path}")
+
+    last_frame = None
+    width = height = 0
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # 先尝试 seek 到最后几帧（更快）。某些编码 seek 不准，所以试多次。
+        if total > 0:
+            for offset in range(min(8, total)):
+                target = total - 1 - offset
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, target))
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    last_frame = frame
+                    # 继续往后读，能读到比当前更晚的帧就更新
+                    while True:
+                        ret2, fr2 = cap.read()
+                        if not ret2 or fr2 is None:
+                            break
+                        last_frame = fr2
+                    break
+
+        # 兜底：从头线性读到尾
+        if last_frame is None:
+            cap.release()
+            cap = cv2.VideoCapture(video_path)
+            while True:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    break
+                last_frame = frame
+
+        if last_frame is None:
+            raise RuntimeError(f"无法从视频读取任何帧: {video_path}")
+
+        # 确保目标目录存在
+        dst_dir = os.path.dirname(dst_path)
+        if dst_dir:
+            os.makedirs(dst_dir, exist_ok=True)
+
+        # cv2.imwrite 期望 BGR，cv2.VideoCapture 读出来就是 BGR，直接写即可
+        # 注意：cv2.imwrite 在路径含中文/特殊字符时可能失败，用 imencode + 文件写入兜底
+        try:
+            ok = cv2.imwrite(dst_path, last_frame)
+        except Exception:
+            ok = False
+        if not ok:
+            ext = os.path.splitext(dst_path)[1].lower() or ".jpg"
+            success, buf = cv2.imencode(ext, last_frame)
+            if not success:
+                raise RuntimeError(f"cv2.imencode 失败: {dst_path}")
+            with open(dst_path, "wb") as f:
+                f.write(buf.tobytes())
+
+        return width, height
+    finally:
+        try:
+            cap.release()
+        except Exception:
+            pass
 
 
 # ---------- 主节点 ----------
@@ -314,6 +466,21 @@ class AutoSequentialController:
                     "label_on": "自动队列下一次",
                     "label_off": "只跑当前这次",
                 }),
+                "tail_frame_mode": ("BOOLEAN", {
+                    "default": False,
+                    "label_on": "尾帧模式: 用上一段视频最后一帧作首帧",
+                    "label_off": "正常模式: 从目录顺序取首帧",
+                }),
+                "output_dir": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "placeholder": "输出视频目录 (留空 = ComfyUI/output/)",
+                }),
+                "target_resolution": ("STRING", {
+                    "default": "1920x1088",
+                    "multiline": False,
+                    "placeholder": "目标分辨率, 如 1920x1088 (用于过滤掉中间预览视频)",
+                }),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -328,14 +495,17 @@ class AutoSequentialController:
                    first_node_id, last_node_id, **kwargs):
         try:
             files = _resolve_and_scan(directory, pattern, sort_method)
-            return f"{current_index}|{step}|{first_node_id}|{last_node_id}|{len(files)}"
+            tail = "T" if kwargs.get("tail_frame_mode") else "D"
+            return f"{current_index}|{step}|{first_node_id}|{last_node_id}|{len(files)}|{tail}"
         except Exception:
             return f"{current_index}|{step}|err"
 
     def execute(self, directory, pattern, sort_method,
                 first_node_id, last_node_id,
                 current_index, step, loop_when_done,
-                auto_advance, auto_queue, unique_id=None):
+                auto_advance, auto_queue,
+                tail_frame_mode=False, output_dir="", target_resolution="1920x1088",
+                unique_id=None):
 
         files = _resolve_and_scan(directory, pattern, sort_method)
         if not files:
@@ -363,7 +533,8 @@ class AutoSequentialController:
             idx2 = current_index + step
 
         f1, f2 = files[idx1], files[idx2]
-        print(f"[AutoSeq Controller] pair {idx1+1}/{total}: {f1} → {f2}  "
+        mode_label = "尾帧链" if tail_frame_mode else "目录链"
+        print(f"[AutoSeq Controller/{mode_label}] pair {idx1+1}/{total}: {f1} → {f2}  "
               f"(targets: first=#{first_node_id}, last=#{last_node_id})")
 
         return (f1, f2, current_index, total)
@@ -593,6 +764,161 @@ if _HAS_SERVER:
                 "size": os.path.getsize(dst_full),
             })
 
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return web.json_response(
+                {"ok": False, "error": f"{type(e).__name__}: {e}"},
+                status=200,
+            )
+
+    @PromptServer.instance.routes.post("/auto_sequential/extract_tail_frame")
+    async def _extract_tail_frame_endpoint(request):
+        """
+        【尾帧模式核心】扫描 output 目录里最新的、分辨率匹配的视频，
+        把它的最后一帧提取出来，直接覆盖写入 input/<dst_filename>，
+        让目标 LoadImage 自动重新加载（基于文件 SHA256 的 IS_CHANGED）。
+
+        请求体:
+        {
+          "output_dir":      "..." (留空则用 ComfyUI 默认 output 目录),
+          "target_width":    1920,
+          "target_height":   1088,
+          "since_timestamp": 1700000000.0  (留 0 表示不过滤 mtime),
+          "dst_filename":    "00115-1.jpg" (input/ 下的目标文件名)
+        }
+
+        响应:
+        {
+          "ok": true/false,
+          "video_path": "...",
+          "video_mtime": 1700000123.4,
+          "video_resolution": "1920x1088",
+          "dst_full": "...",
+          "dst_filename": "...",
+          "candidates": [...]  (前 5 个候选，方便调试),
+          "error": ""
+        }
+        """
+        try:
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+
+            output_dir = (data.get("output_dir") or "").strip()
+            try:
+                target_w = int(data.get("target_width") or 1920)
+                target_h = int(data.get("target_height") or 1088)
+            except (TypeError, ValueError):
+                target_w, target_h = 1920, 1088
+            try:
+                since_ts = float(data.get("since_timestamp") or 0)
+            except (TypeError, ValueError):
+                since_ts = 0.0
+            dst_filename = (data.get("dst_filename") or "").strip()
+
+            if not dst_filename:
+                return web.json_response({"ok": False, "error": "dst_filename 为空"})
+
+            # 默认用 ComfyUI 的 output 目录
+            if not output_dir:
+                try:
+                    import folder_paths
+                    output_dir = folder_paths.get_output_directory()
+                except Exception as e:
+                    return web.json_response(
+                        {"ok": False, "error": f"无法获取 output 目录: {e}"})
+
+            output_dir = os.path.expanduser(output_dir)
+            if not os.path.isdir(output_dir):
+                return web.json_response(
+                    {"ok": False, "error": f"output 目录不存在: {output_dir}"})
+
+            # 扫描 since_ts 之后写入的所有视频（已按 mtime 从新到旧排序）
+            videos = _scan_videos(output_dir, since_mtime=since_ts)
+            if not videos:
+                return web.json_response({
+                    "ok": False,
+                    "error": (
+                        f"在 {output_dir} 里没找到 since_timestamp={since_ts} 之后的"
+                        f"视频文件 (扩展名: {','.join(VIDEO_EXTENSIONS)})"
+                    ),
+                })
+
+            # 在候选里找第一个分辨率匹配的（最新的）
+            candidates = []
+            matched = None
+            for path, mtime in videos[:20]:  # 最多看 20 个，避免目录里视频太多时太慢
+                w, h = _get_video_resolution(path)
+                candidates.append({
+                    "path": path,
+                    "mtime": mtime,
+                    "resolution": f"{w}x{h}",
+                })
+                if matched is None and w == target_w and h == target_h:
+                    matched = (path, mtime, w, h)
+
+            if not matched:
+                return web.json_response({
+                    "ok": False,
+                    "error": (
+                        f"没在最近的视频里找到 {target_w}x{target_h} 分辨率的。"
+                        f"前 5 个候选: " +
+                        ", ".join(
+                            f"{os.path.basename(c['path'])}({c['resolution']})"
+                            for c in candidates[:5]
+                        )
+                    ),
+                    "candidates": candidates[:10],
+                })
+
+            video_path, video_mtime, vw, vh = matched
+
+            # 解析 dst 到 input/ 下
+            try:
+                import folder_paths
+                input_dir = os.path.abspath(folder_paths.get_input_directory())
+            except Exception as e:
+                return web.json_response(
+                    {"ok": False, "error": f"无法获取 input 目录: {e}"})
+
+            dst_clean = dst_filename.replace("\\", "/").lstrip("/")
+            dst_full = os.path.abspath(os.path.join(input_dir, dst_clean))
+
+            if not _is_under(dst_full, input_dir):
+                return web.json_response({
+                    "ok": False,
+                    "error": f"dst_filename 必须在 input/ 下: {dst_filename} → {dst_full}",
+                })
+
+            # 提取最后一帧并写入到 input/<dst_filename>
+            try:
+                _extract_video_last_frame(video_path, dst_full)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                return web.json_response(
+                    {"ok": False, "error": f"提取最后一帧失败: {e}"})
+
+            print(
+                f"[AutoSeq] 尾帧抽取: {os.path.basename(video_path)} "
+                f"({vw}x{vh}, mtime={video_mtime:.1f}) "
+                f"→ input/{dst_clean}"
+            )
+
+            return web.json_response({
+                "ok": True,
+                "video_path": video_path,
+                "video_mtime": video_mtime,
+                "video_resolution": f"{vw}x{vh}",
+                "dst_full": dst_full,
+                "dst_filename": dst_filename,
+                "candidates": candidates[:5],
+                "error": "",
+            })
         except Exception as e:
             import traceback
             traceback.print_exc()

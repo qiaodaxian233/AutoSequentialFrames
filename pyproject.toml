@@ -1,9 +1,9 @@
 [project]
 name = "comfyui-autosequentialframes"
-description = "自动顺序读取目录图片，作为 Wan2.2 等首尾帧视频生成的输入。生成完毕后自动把上一次的尾帧作为下一次的首帧，并自动队列下一次。"
-version = "1.0.0"
+description = "自动顺序读取目录图片，作为 Wan2.2 等首尾帧视频生成的输入。生成完毕后自动把上一次的尾帧作为下一次的首帧，并自动队列下一次。新增尾帧模式：直接用上一段输出视频的最后一帧作下一段首帧。"
+version = "1.1.0"
 license = {text = "MIT"}
-dependencies = []
+dependencies = ["opencv-python"]
 
 [project.urls]
 Repository = "https://github.com/yourname/ComfyUI-AutoSequentialFrames"

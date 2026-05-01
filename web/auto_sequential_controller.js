@@ -18,6 +18,7 @@ const NODE_TYPE = "AutoSequentialController";
 const ENDPOINT_SCAN   = "/auto_sequential/scan";
 const ENDPOINT_INJECT = "/auto_sequential/inject";
 const ENDPOINT_LINK   = "/auto_sequential/link";
+const ENDPOINT_TAIL   = "/auto_sequential/extract_tail_frame";
 
 const executedThisRun = new Set();
 
@@ -152,6 +153,38 @@ async function createLink(srcPath) {
         });
         return await res.json();
     } catch (e) { return { ok: false, error: String(e) }; }
+}
+
+// 尾帧模式：让后端去 output/ 找最新的、分辨率匹配的视频，
+// 抽出最后一帧，直接覆盖写入 input/<dstFilename>
+async function extractTailFrameToSlot(node, dstFilename, sinceTimestamp) {
+    const targetRes = (getWidget(node, "target_resolution")?.value || "1920x1088").trim();
+    const outDir = (getWidget(node, "output_dir")?.value || "").trim();
+
+    // 解析 "1920x1088" / "1920*1088" / "1920×1088"
+    const m = targetRes.match(/(\d+)\s*[xX*×]\s*(\d+)/);
+    if (!m) {
+        return { ok: false, error: `target_resolution 格式无效: ${targetRes}（应为 "1920x1088" 这种）` };
+    }
+    const tw = parseInt(m[1]);
+    const th = parseInt(m[2]);
+
+    try {
+        const res = await fetch(ENDPOINT_TAIL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                output_dir: outDir,
+                target_width: tw,
+                target_height: th,
+                since_timestamp: sinceTimestamp || 0,
+                dst_filename: dstFilename,
+            }),
+        });
+        return await res.json();
+    } catch (e) {
+        return { ok: false, error: String(e) };
+    }
 }
 
 // ---------- 强制刷新 LoadImage 的预览图（保护节点位置/尺寸不变）----------
@@ -290,6 +323,103 @@ async function applyCurrentPair(node, opts = {}) {
     return true;
 }
 
+// ---------- 尾帧模式：用上一段视频的最后一帧覆盖首帧槽位，目录里的下一张图覆盖尾帧槽位 ----------
+
+async function applyTailPair(node) {
+    const data = await scanFor(node);
+    if (!data) {
+        updateStatus(node, "❌ 扫描失败（看 F12 控制台 + ComfyUI 黑窗口日志）");
+        return false;
+    }
+    if (data.error) { updateStatus(node, `❌ 后端错误: ${data.error}`); return false; }
+    if (!data.exists) { updateStatus(node, `❌ 目录不存在: ${data.directory}`); return false; }
+    if (data.count < 1) { updateStatus(node, `⚠️ 目录里没有图片`); return false; }
+
+    const idx = getWidget(node, "current_index")?.value ?? 0;
+    const step = getWidget(node, "step")?.value ?? 1;
+    const loop = !!getWidget(node, "loop_when_done")?.value;
+
+    // 在尾帧模式下：首帧 = 上一段视频最后一帧 (不从 idx 取)，尾帧 = directory[idx+step]
+    let i2;
+    if (loop) {
+        i2 = (idx + step) % data.count;
+    } else {
+        if (idx + step > data.count - 1) {
+            updateStatus(node, `✅ 已遍历完 ${data.count} 张目标关键帧`);
+            return false;
+        }
+        i2 = idx + step;
+    }
+    const f2 = data.files[i2];
+
+    const sep = data.resolved.includes("\\") ? "\\" : "/";
+    const src2 = data.resolved.replace(/[/\\]+$/, "") + sep + f2;
+
+    // 找两个 LoadImage
+    const firstId = String(getWidget(node, "first_node_id")?.value || "").trim();
+    const lastId  = String(getWidget(node, "last_node_id")?.value  || "").trim();
+    if (!firstId || !lastId) {
+        updateStatus(node, "⚠️ 还没选 LoadImage 节点（点上面 📋 按钮）");
+        return false;
+    }
+    const firstNode = findNodeByPathId(app.graph, firstId);
+    const lastNode  = findNodeByPathId(app.graph, lastId);
+    if (!firstNode) { updateStatus(node, `❌ 找不到 LoadImage #${firstId}`); return false; }
+    if (!lastNode)  { updateStatus(node, `❌ 找不到 LoadImage #${lastId}`); return false; }
+
+    const slot1 = getWidget(firstNode, "image")?.value;
+    const slot2 = getWidget(lastNode, "image")?.value;
+    if (!slot1 || !slot2) {
+        updateStatus(node,
+            `⚠️ 目标 LoadImage 还没上传任何图作占位。` +
+            `请先在 LoadImage #${firstId} / #${lastId} 各自上传占位图。`
+        );
+        return false;
+    }
+    if (slot1 === slot2) {
+        updateStatus(node,
+            `⚠️ 两个 LoadImage 的占位文件名重复 (都是 ${slot1})。` +
+            `请给它们上传不同文件名的占位图。`
+        );
+        return false;
+    }
+
+    // 1) 让后端去 output/ 抽尾帧 → 直接写到 input/<slot1>
+    const sinceTs = node._sessionStartTime || 0;
+    const tailRes = await extractTailFrameToSlot(node, slot1, sinceTs);
+    if (!tailRes.ok) {
+        updateStatus(node, `❌ 尾帧抽取失败: ${tailRes.error}`);
+        console.warn("[AutoSeq Ctrl] 尾帧抽取失败，候选视频:", tailRes.candidates);
+        return false;
+    }
+
+    // 2) 把目录里下一张目标关键帧覆盖到 slot2
+    const r2 = await injectFile(src2, slot2);
+    if (!r2.ok) { updateStatus(node, `❌ 覆盖目标关键帧失败: ${r2.error}`); return false; }
+
+    // 3) 刷新两个 LoadImage 的预览图（不改它们的位置/尺寸）
+    refreshLoadImagePreview(firstNode);
+    refreshLoadImagePreview(lastNode);
+
+    const totalPairs = Math.max(0, data.count - step);
+    const videoBase = (tailRes.video_path || "").split(/[\/\\]/).pop() || "?";
+    updateStatus(node,
+        `✅ 尾帧模式: [${videoBase} 末帧 → 槽位 ${slot1}]  &  ` +
+        `[${f2} → 槽位 ${slot2}]   进度 ${idx}/${totalPairs}  ` +
+        `(${tailRes.video_resolution})`
+    );
+    return true;
+}
+
+// 根据 tail_frame_mode 开关决定走哪个分支
+async function applyForCurrentMode(node, opts = {}) {
+    const tailMode = !!getWidget(node, "tail_frame_mode")?.value;
+    if (tailMode && !opts.forceFromDirectory) {
+        return applyTailPair(node);
+    }
+    return applyCurrentPair(node);
+}
+
 // ---------- 注册 ----------
 
 app.registerExtension({
@@ -319,7 +449,21 @@ app.registerExtension({
             });
 
             this.addWidget("button", "🔄 应用当前 index（覆盖到 LoadImage）", null, async () => {
+                // 手动按这里 = 强制按目录顺序应用（即使在尾帧模式下，也是从 directory 取首帧）
+                // 这是初始化链条用的，第一段视频还没生成时只能这样起步
                 await applyCurrentPair(this);
+            });
+
+            this.addWidget("button", "🔁 应用尾帧对（用上一段视频末帧作首帧）", null, async () => {
+                // 手动触发尾帧模式应用：找最新的匹配视频，抽末帧 → 首帧槽位
+                // 适合：① 调试尾帧模式 ② 中途从已有视频继续接力
+                if (!node._sessionStartTime) {
+                    // 没记录过 session 开始时间，让用户决定是否考虑历史所有视频
+                    if (!confirm("还没有本次会话的执行记录。\n是否扫描 output/ 里的所有历史视频？\n（点取消放弃；点确定将考虑所有历史视频。）")) {
+                        return;
+                    }
+                }
+                await applyTailPair(this);
             });
 
             this.addWidget("button", "🔗 (可选) 把目录链接进 input/", null, async () => {
@@ -335,10 +479,14 @@ app.registerExtension({
 
             this.addWidget("button", "⏮ 重置 current_index 为 0", null, () => {
                 setWidgetValue(this, "current_index", 0);
+                // 重置 = 让链条重新起步 → 强制走目录模式
+                this._sessionStartTime = 0;
                 applyCurrentPair(this);
             });
 
             this.addWidget("button", "▶ 立即开始（应用 + 队列一次）", null, async () => {
+                // 手动开始 = 从目录顺序起步（首帧来自 directory[idx]）
+                // 后续接力时，如果开了 tail_frame_mode，自动切到尾帧模式
                 const ok = await applyCurrentPair(this);
                 if (ok) setTimeout(() => app.queuePrompt(0, 1), 250);
             });
@@ -369,7 +517,18 @@ app.registerExtension({
     },
 
     async setup() {
-        api.addEventListener("execution_start", () => executedThisRun.clear());
+        api.addEventListener("execution_start", () => {
+            executedThisRun.clear();
+            // 标记每个 Controller 节点本次执行的开始时间，
+            // 之后提取尾帧时只看这之后写入的视频，避免找到老视频
+            const now = Date.now() / 1000; // unix seconds
+            for (const node of (app.graph?._nodes || [])) {
+                if (node.type === NODE_TYPE) {
+                    // 减 2 秒缓冲，应付 mtime 精度差 / 时钟轻微不同步
+                    node._sessionStartTime = now - 2;
+                }
+            }
+        });
         api.addEventListener("executing", ({ detail }) => {
             if (detail !== null && detail !== undefined) executedThisRun.add(String(detail));
         });
@@ -379,8 +538,12 @@ app.registerExtension({
             for (const node of myNodes) {
                 if (!executedThisRun.has(String(node.id))) continue;
 
+                const tailMode = !!getWidget(node, "tail_frame_mode")?.value;
+
                 if (!getWidget(node, "auto_advance")?.value) {
-                    await applyCurrentPair(node);
+                    // 不自动推进 index，但仍按当前模式刷新一下显示
+                    if (tailMode) await applyTailPair(node);
+                    else await applyCurrentPair(node);
                     continue;
                 }
 
@@ -388,9 +551,16 @@ app.registerExtension({
                 const step = getWidget(node, "step")?.value ?? 1;
                 const newIdx = cur + step;
                 setWidgetValue(node, "current_index", newIdx);
-                console.log(`[AutoSeq Ctrl] node #${node.id} 推进 → ${newIdx}`);
+                console.log(
+                    `[AutoSeq Ctrl] node #${node.id} 推进 → ${newIdx}  ` +
+                    `(${tailMode ? "尾帧模式" : "目录模式"})`
+                );
 
-                const ok = await applyCurrentPair(node);
+                // 关键：execution_success 之后是「下一段」的准备阶段，
+                // 此时如果开了尾帧模式，就用刚生成视频的最后一帧作首帧
+                const ok = tailMode
+                    ? await applyTailPair(node)
+                    : await applyCurrentPair(node);
                 if (!ok) { console.log("[AutoSeq Ctrl] 应用失败或到达末尾"); continue; }
 
                 if (!getWidget(node, "auto_queue")?.value) continue;

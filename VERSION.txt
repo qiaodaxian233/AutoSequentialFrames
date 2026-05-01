@@ -1,7 +1,20 @@
-版本: v3-overlay-mode
+版本: v4-tail-frame-mode
 日期: 2026-05-01
-特性: 覆盖式上传模式 (不修改 LoadImage 的 widget 值)
+特性: 新增「尾帧模式」(tail_frame_mode)
 关键改动:
-  - 后端新增 /auto_sequential/inject 接口 (shutil.copyfile)
-  - 前端不再调用 setWidgetValue 改 LoadImage
-  - 通过覆盖 input/<占位文件名> 的内容实现切图
+  - Controller 节点新增 3 个 widget: tail_frame_mode / output_dir / target_resolution
+  - 后端新增 /auto_sequential/extract_tail_frame 接口 (cv2 抽帧)
+  - 前端 execution_success 时，开了尾帧模式则用上一段视频末帧覆盖首帧槽位
+  - 默认按 1920x1088 过滤视频，自动跳过中间预览/低分辨率版本
+  - 新增按钮 "🔁 应用尾帧对" 用于手动调试
+依赖:
+  - opencv-python (尾帧模式需要; 99% 的 ComfyUI 环境自带)
+向后兼容:
+  - tail_frame_mode 默认 False, 旧工作流加载后行为完全不变
+
+历史版本:
+  v3-overlay-mode (2026-05-01)
+    - 覆盖式上传模式 (不修改 LoadImage 的 widget 值)
+    - 后端 /auto_sequential/inject 接口 (shutil.copyfile)
+    - 前端不再调用 setWidgetValue 改 LoadImage
+    - 通过覆盖 input/<占位文件名> 的内容实现切图
