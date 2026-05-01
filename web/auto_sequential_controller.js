@@ -154,20 +154,46 @@ async function createLink(srcPath) {
     } catch (e) { return { ok: false, error: String(e) }; }
 }
 
-// ---------- 强制刷新 LoadImage 的预览图 ----------
+// ---------- 强制刷新 LoadImage 的预览图（保护节点位置/尺寸不变）----------
 //
-// 文件内容变了，但 widget 值没变；浏览器/ComfyUI 可能用缓存的预览图。
-// 这里清掉节点缓存 + 重新触发 image widget 的 callback。
+// 直接 set node.imgs = null + 重新 callback 会导致 LoadImage 按新图的宽高比
+// 重算节点尺寸，然后整个画布的相对布局就被挤歪了。
+// 解决：操作前保存 size + pos，操作后用 setTimeout 多次恢复回去（防止 LoadImage
+// 异步加载完图片后又改尺寸）。
 
 function refreshLoadImagePreview(node) {
     if (!node) return;
-    try { node.imgs = null; node.imageIndex = 0; } catch (e) {}
+
+    // 1) 保存当前几何信息
+    const savedPos = node.pos ? [node.pos[0], node.pos[1]] : null;
+    const savedSize = node.size ? [node.size[0], node.size[1]] : null;
+
+    // 2) 锁定 onResize（如果 LoadImage 想自动调整尺寸，挡掉）
+    const origOnResize = node.onResize;
+    node.onResize = function () { /* 拒绝自动 resize */ };
+
+    // 3) 触发 widget callback 让 LoadImage 重新拉预览图
+    //    （ComfyUI 内置 imageUpload widget 会自动加 rand 参数防浏览器缓存）
     const w = getWidget(node, "image");
     if (w && typeof w.callback === "function") {
         try { w.callback(w.value); } catch (e) {}
     }
-    node.setDirtyCanvas?.(true, true);
-    app.graph?.setDirtyCanvas?.(true, true);
+
+    // 4) 多次恢复几何信息：图片可能要等几十毫秒才异步加载完，
+    //    LoadImage 拿到图后还会再尝试 resize 一次，需要在不同时刻多挡几次
+    const restore = () => {
+        if (savedPos && node.pos) { node.pos[0] = savedPos[0]; node.pos[1] = savedPos[1]; }
+        if (savedSize && node.size) { node.size[0] = savedSize[0]; node.size[1] = savedSize[1]; }
+        node.setDirtyCanvas?.(true, false);
+    };
+    restore();
+    setTimeout(restore, 50);
+    setTimeout(restore, 200);
+    setTimeout(() => {
+        restore();
+        // 最后把 onResize 还原回去（让用户能正常拖角调大小）
+        node.onResize = origOnResize;
+    }, 800);
 }
 
 // ---------- 状态行 ----------
