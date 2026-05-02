@@ -1,35 +1,44 @@
-版本: v5-history-and-rewind
+版本: v6-disk-scan-and-resfilter
 日期: 2026-05-02
-特性: 视频历史管理 + 上一对回退 + 手动选视频抽尾帧
+特性: 🎞 改为扫磁盘列视频 + register 分辨率过滤可控
 
 关键改动:
-  - 后端新增视频历史持久化 (~/user/auto_sequential_history.json)，按 controller_id 隔离
-  - 后端新增 4 个接口:
-      /auto_sequential/register_video    每次执行成功后登记刚生成的视频
-      /auto_sequential/list_videos       列出某节点的视频队列 (含 exists 标记)
-      /auto_sequential/pop_last_video    弹出队列尾 (用于「上一对」回退)
-      /auto_sequential/clear_history     清空某节点(或全部)历史
-  - 后端 /auto_sequential/extract_tail_frame 接口加 video_path 参数:
-      传了就直接抽指定视频的末帧；不传则保留原扫盘自动选最新行为
-  - 前端 execution_success 时先调 register_video 把刚跑出的视频进队列
-  - 前端新增 4 个按钮:
-      ⬅ 上一对 (回退一段视频) — current_index -= step + 弹掉队列尾 + 用「现在的队尾」抽尾帧
-      🎞 选视频抽尾帧 (手动指定) — 弹出本会话视频列表，点一个就用它的末帧覆盖首帧槽位
-      📜 查看视频历史
-      🗑 清空视频历史
-  - 修复: ⏭ 跳过当前对 在尾帧模式下现在会用最近一段视频的末帧作首帧
-         (旧行为是不管尾帧模式总是从目录取，会破坏视频链接续)
-  - 修复: 🔁 应用尾帧对 按钮内 node._sessionStartTime 误用 (应为 this)
-
-依赖:
-  - opencv-python (尾帧模式需要; 99% 的 ComfyUI 环境自带)
+  - 后端新增 /auto_sequential/list_dir_videos 接口
+      直接扫 output_dir 磁盘 (不依赖会话队列), 返回所有视频
+      每条带分辨率 / mtime / size / in_queue 标记
+      max_count 上限 200, since_timestamp 可选过滤
+  - 后端 /auto_sequential/register_video 加 only_target_res 参数
+      默认 true (兼容旧行为, 推荐): 只登记 target_resolution 的视频, 过滤掉预览版
+      false: 取 since_timestamp 之后最新的视频, 不管分辨率
+      失败时返回 skipped_reason = "no_target_res_match", 前端可识别为预期跳过
+  - 节点新增 widget register_only_target_res (BOOLEAN, 默认开)
+      控制上述参数, 用户可关掉过滤
+  - 前端 🎞 按钮改名 "选视频抽尾帧（从 output_dir）"
+      改为调 list_dir_videos 接口, 列出磁盘上所有视频
+      弹窗工具栏: 「只看 target_resolution」复选框 + 文件名搜索框
+      每条标注: 文件名 / 分辨率 (★target / 非 target) / 时间 / 大小 / 是否在队列
+      响应式过滤, 队列里的视频带 📜 标记
+  - 前端 register_video 失败 with skipped_reason = "no_target_res_match"
+      console.log (而非 warn), 提示用户: 可关掉 register_only_target_res
 
 向后兼容:
-  - 所有旧按钮行为不变
-  - 历史文件不存在时正常工作 (空队列)
-  - 加载老工作流不需要任何手动迁移
+  - 所有旧按钮、旧接口行为不变
+  - register_video 默认开过滤 = 旧行为
+  - 老工作流加载时 register_only_target_res 用默认值 true
+
+修复的根因:
+  原版 🎞 只看会话队列 (list_videos), 队列依赖 execution_success 触发的 register。
+  在多次工作流之间, 或预览版/终版同时输出导致 register 跳过的情况下, 队列会
+  停留在旧值 (例: 磁盘到 18, 队列只到 16)。新版直接扫磁盘, 永远反映真实状态。
 
 历史版本:
+  v5-history-and-rewind (2026-05-02)
+    - 视频历史持久化 (~/user/auto_sequential_history.json)
+    - 新增 4 个接口: register_video / list_videos / pop_last_video / clear_history
+    - extract_tail_frame 加 video_path 参数
+    - 新增按钮: ⬅ 上一对 / 🎞 选视频抽尾帧 / 📜 视频历史 / 🗑 清空历史
+    - 修复: ⏭ 跳过当前对 在尾帧模式下用最近一段视频末帧
+    - 修复: 🔁 应用尾帧对 内 node._sessionStartTime 误用 (应为 this)
   v4-tail-frame-mode (2026-05-01)
     - 新增「尾帧模式」(tail_frame_mode)
     - Controller 节点新增 3 个 widget

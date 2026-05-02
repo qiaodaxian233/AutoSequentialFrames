@@ -622,6 +622,11 @@ class AutoSequentialController:
                     "multiline": False,
                     "placeholder": "目标分辨率, 如 1920x1088 (用于过滤掉中间预览视频)",
                 }),
+                "register_only_target_res": ("BOOLEAN", {
+                    "default": True,
+                    "label_on": "登记: 只保留 target_resolution (推荐, 过滤预览版)",
+                    "label_off": "登记: 取最新的视频 (不管分辨率)",
+                }),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -646,6 +651,7 @@ class AutoSequentialController:
                 current_index, step, loop_when_done,
                 auto_advance, auto_queue,
                 tail_frame_mode=False, output_dir="", target_resolution="1920x1088",
+                register_only_target_res=True,
                 unique_id=None):
 
         files = _resolve_and_scan(directory, pattern, sort_method)
@@ -1106,8 +1112,8 @@ if _HAS_SERVER:
     @PromptServer.instance.routes.post("/auto_sequential/register_video")
     async def _register_video_endpoint(request):
         """
-        每次执行成功后由前端调用：扫 output/ 找最新的、分辨率匹配的视频，
-        登记进 controller_id 对应的视频队列。
+        每次执行成功后由前端调用：扫 output/ 找最新的视频，登记进
+        controller_id 对应的视频队列。
 
         请求体:
         {
@@ -1118,7 +1124,10 @@ if _HAS_SERVER:
           "since_timestamp": 1700000000.0,
           "segment_index":   3,                # 链条第几段，前端记
           "first_filename":  "frame_003.jpg",  # 这一段用的首帧目录文件名
-          "last_filename":   "frame_004.jpg"   # 尾帧
+          "last_filename":   "frame_004.jpg",  # 尾帧
+          "only_target_res": true              # 默认 true: 只登记 target_resolution 的
+                                               #          (过滤掉一次工作流里的预览版)
+                                               # false:    登记 since_timestamp 之后最新的视频
         }
 
         响应:
@@ -1126,6 +1135,7 @@ if _HAS_SERVER:
           "ok": true,
           "registered": {video_path, mtime, resolution, segment_index, ...},
           "queue_length": 5,
+          "skipped_reason": "" | "no_target_res_match",
           "error": ""
         }
         """
@@ -1152,6 +1162,12 @@ if _HAS_SERVER:
             except (TypeError, ValueError):
                 since_ts = 0.0
 
+            # 默认开启分辨率过滤 (用来过滤掉一次工作流里同时输出的预览版)
+            only_target_res = data.get("only_target_res")
+            if only_target_res is None:
+                only_target_res = True
+            only_target_res = bool(only_target_res)
+
             if not output_dir:
                 try:
                     import folder_paths
@@ -1173,17 +1189,27 @@ if _HAS_SERVER:
                 })
 
             matched = None
-            for path, mtime in videos[:20]:
+            if only_target_res:
+                # 严格按 target_resolution 过滤, 找最新匹配
+                for path, mtime in videos[:20]:
+                    w, h = _get_video_resolution(path)
+                    if w == target_w and h == target_h:
+                        matched = (path, mtime, w, h)
+                        break
+                if not matched:
+                    return web.json_response({
+                        "ok": False,
+                        "skipped_reason": "no_target_res_match",
+                        "error": (
+                            f"未找到 {target_w}x{target_h} 分辨率的最近视频"
+                            f" (本次工作流可能还在跑预览版, 或目标分辨率配错)"
+                        ),
+                    })
+            else:
+                # 不过滤: 直接取 since_timestamp 之后最新的那一个
+                path, mtime = videos[0]
                 w, h = _get_video_resolution(path)
-                if w == target_w and h == target_h:
-                    matched = (path, mtime, w, h)
-                    break
-
-            if not matched:
-                return web.json_response({
-                    "ok": False,
-                    "error": f"未找到 {target_w}x{target_h} 分辨率的最近视频",
-                })
+                matched = (path, mtime, w, h)
 
             video_path, video_mtime, vw, vh = matched
 
@@ -1210,6 +1236,7 @@ if _HAS_SERVER:
                 "ok": True,
                 "registered": entry,
                 "queue_length": len(queue),
+                "skipped_reason": "",
                 "error": "",
             })
         except Exception as e:
@@ -1320,6 +1347,119 @@ if _HAS_SERVER:
             traceback.print_exc()
             return web.json_response(
                 {"ok": False, "error": f"{type(e).__name__}: {e}"},
+                status=200,
+            )
+
+    @PromptServer.instance.routes.post("/auto_sequential/list_dir_videos")
+    async def _list_dir_videos_endpoint(request):
+        """
+        直接扫磁盘列出 output_dir 下的所有视频（不依赖会话队列）。
+        每一项带分辨率、mtime 和「是否在本节点队列里」标记。
+
+        请求体:
+        {
+          "controller_id": "12",          # 可选, 用来标记 in_queue
+          "output_dir":    "...",         # 留空则用 ComfyUI 默认 output 目录
+          "max_count":     50,            # 默认 50, 上限 200
+          "since_timestamp": 0.0          # 可选, 只看这个时间之后的; 0 = 全部
+        }
+
+        响应:
+        {
+          "ok": true,
+          "output_dir": "...",
+          "videos": [
+            {
+              "video_path":     "...",
+              "video_basename": "VID_00018.mp4",
+              "mtime":          1700000123.4,
+              "resolution":     "1920x1088",
+              "size_bytes":     12345678,
+              "in_queue":       true|false,
+              "queue_segment":  3 | null
+            },
+            ...
+          ],
+          "count": 18,
+          "error": ""
+        }
+        """
+        try:
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+
+            controller_id = (data.get("controller_id") or "").strip()
+            output_dir = (data.get("output_dir") or "").strip()
+            try:
+                max_count = int(data.get("max_count") or 50)
+            except (TypeError, ValueError):
+                max_count = 50
+            max_count = max(1, min(200, max_count))
+            try:
+                since_ts = float(data.get("since_timestamp") or 0)
+            except (TypeError, ValueError):
+                since_ts = 0.0
+
+            if not output_dir:
+                try:
+                    import folder_paths
+                    output_dir = folder_paths.get_output_directory()
+                except Exception as e:
+                    return web.json_response(
+                        {"ok": False, "error": f"无法获取 output 目录: {e}", "videos": []})
+
+            output_dir = os.path.expanduser(output_dir)
+            if not os.path.isdir(output_dir):
+                return web.json_response(
+                    {"ok": False, "error": f"output 目录不存在: {output_dir}", "videos": []})
+
+            # 扫磁盘 (按 mtime 倒序)
+            scanned = _scan_videos(output_dir, since_mtime=since_ts)
+            scanned = scanned[:max_count]
+
+            # 取本节点的队列, 给每个磁盘视频标 in_queue
+            queue_paths = {}
+            if controller_id:
+                for q in _history_get_list(controller_id):
+                    p = q.get("video_path", "")
+                    if p:
+                        queue_paths[p] = q.get("segment_index")
+
+            videos = []
+            for path, mtime in scanned:
+                w, h = _get_video_resolution(path)
+                try:
+                    size_bytes = os.path.getsize(path)
+                except OSError:
+                    size_bytes = 0
+                videos.append({
+                    "video_path": path,
+                    "video_basename": os.path.basename(path),
+                    "mtime": mtime,
+                    "resolution": f"{w}x{h}" if w and h else "?",
+                    "width": w,
+                    "height": h,
+                    "size_bytes": size_bytes,
+                    "in_queue": path in queue_paths,
+                    "queue_segment": queue_paths.get(path),
+                })
+
+            return web.json_response({
+                "ok": True,
+                "output_dir": output_dir,
+                "videos": videos,
+                "count": len(videos),
+                "error": "",
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return web.json_response(
+                {"ok": False, "error": f"{type(e).__name__}: {e}", "videos": []},
                 status=200,
             )
 

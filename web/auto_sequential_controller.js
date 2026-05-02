@@ -21,6 +21,7 @@ const ENDPOINT_LINK     = "/auto_sequential/link";
 const ENDPOINT_TAIL     = "/auto_sequential/extract_tail_frame";
 const ENDPOINT_REGISTER = "/auto_sequential/register_video";
 const ENDPOINT_LIST     = "/auto_sequential/list_videos";
+const ENDPOINT_LIST_DIR = "/auto_sequential/list_dir_videos";
 const ENDPOINT_POP      = "/auto_sequential/pop_last_video";
 const ENDPOINT_CLEAR    = "/auto_sequential/clear_history";
 
@@ -133,68 +134,152 @@ function _formatTime(unixSec) {
 }
 
 async function pickVideoDialog(node, title) {
-    const resp = await listVideos(node);
-    if (!resp.ok) { alert("读取视频历史失败: " + (resp.error || "?")); return null; }
-    const videos = resp.videos || [];
-    if (videos.length === 0) {
-        alert("本会话还没有登记过视频。\n先点 ▶ 立即开始 跑一段视频，或者用「应用尾帧对」走一次扫盘流程。");
+    // 直接扫 output_dir 磁盘 (绕开会话队列, 看到所有视频)
+    const resp = await listDirVideos(node, 80);
+    if (!resp.ok) {
+        alert("读取视频目录失败: " + (resp.error || "?"));
         return null;
     }
+    const videos = resp.videos || [];
+    if (videos.length === 0) {
+        alert(
+            `${resp.output_dir || "?"} 里没找到任何视频文件。\n` +
+            `请检查 output_dir widget 是否填对 (留空 = ComfyUI/output)。`
+        );
+        return null;
+    }
+
+    // 取本节点 target_resolution 用于标记 / 默认过滤
+    const targetRes = (getWidget(node, "target_resolution")?.value || "1920x1088").trim();
+    const m = targetRes.match(/(\d+)\s*[xX*×]\s*(\d+)/);
+    const tw = m ? parseInt(m[1]) : 0;
+    const th = m ? parseInt(m[2]) : 0;
+    const isTarget = (v) => tw && th && v.width === tw && v.height === th;
 
     return new Promise((resolve) => {
         const overlay = document.createElement("div");
         overlay.style.cssText = `position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:9999;display:flex;align-items:center;justify-content:center;`;
         const dlg = document.createElement("div");
-        dlg.style.cssText = `background:#2a2a2a;color:#fff;padding:20px;border-radius:8px;border:1px solid #555;min-width:520px;max-width:80vw;max-height:75vh;overflow-y:auto;font-family:sans-serif;font-size:13px;`;
+        dlg.style.cssText = `background:#2a2a2a;color:#fff;padding:20px;border-radius:8px;border:1px solid #555;min-width:600px;max-width:85vw;max-height:80vh;overflow:hidden;display:flex;flex-direction:column;font-family:sans-serif;font-size:13px;`;
+
         const h = document.createElement("h3");
         h.textContent = title || "选一段视频抽尾帧";
         h.style.cssText = "margin:0 0 6px 0;font-size:15px;";
         dlg.appendChild(h);
 
         const sub = document.createElement("div");
-        sub.textContent = `本会话已登记 ${videos.length} 段视频（最新的在最下面）`;
-        sub.style.cssText = "color:#aaa;font-size:11px;margin-bottom:10px;";
+        sub.innerHTML = `📂 <span style="color:#9cc;font-family:monospace">${resp.output_dir}</span><br>` +
+            `共 ${videos.length} 个视频文件 (按修改时间倒序, 最新的在最上面)`;
+        sub.style.cssText = "color:#aaa;font-size:11px;margin-bottom:8px;line-height:1.5;";
         dlg.appendChild(sub);
 
-        // 倒序展示：最新的在上面更易点
-        const list = videos.slice().reverse();
-        list.forEach((v, idx) => {
-            const seg = (v.segment_index !== undefined && v.segment_index !== null)
-                ? `#${v.segment_index}` : "";
-            const exists = !!v.exists;
-            const b = document.createElement("button");
-            const time = _formatTime(v.mtime);
-            const fname = v.video_basename || (v.video_path || "").split(/[\/\\]/).pop() || "?";
-            const pair = (v.first_filename || v.last_filename)
-                ? ` ⟵ (${v.first_filename || "?"} → ${v.last_filename || "?"})`
-                : "";
-            b.innerHTML = (exists ? "" : "🚫 ") +
-                `<b>${seg}</b>  ${fname}  <span style="color:#9c9">${v.resolution || ""}</span>  ` +
-                `<span style="color:#888">${time}</span>` +
-                `<span style="color:#777;font-size:11px">${pair}</span>`;
-            b.disabled = !exists;
-            b.title = v.video_path || "";
-            b.style.cssText = `display:block;width:100%;margin:4px 0;padding:8px 10px;` +
-                `background:${exists ? '#3a3a3a' : '#2a1a1a'};color:${exists ? '#eee' : '#888'};` +
-                `border:1px solid #555;border-radius:4px;text-align:left;` +
-                `cursor:${exists ? 'pointer' : 'not-allowed'};font-family:monospace;font-size:12px;`;
-            if (exists) {
+        // 工具栏: 仅显示 target_resolution + 搜索
+        const toolbar = document.createElement("div");
+        toolbar.style.cssText = "display:flex;gap:10px;align-items:center;margin-bottom:8px;font-size:12px;";
+
+        const filterCb = document.createElement("input");
+        filterCb.type = "checkbox";
+        filterCb.id = "_aseq_filter_target";
+        filterCb.checked = false;
+        const filterLbl = document.createElement("label");
+        filterLbl.htmlFor = filterCb.id;
+        filterLbl.textContent = ` 只看 ${targetRes}`;
+        filterLbl.style.cssText = "color:#bcb;cursor:pointer;user-select:none;";
+        toolbar.appendChild(filterCb);
+        toolbar.appendChild(filterLbl);
+
+        const sep = document.createElement("span");
+        sep.textContent = "|";
+        sep.style.color = "#555";
+        toolbar.appendChild(sep);
+
+        const searchInput = document.createElement("input");
+        searchInput.type = "text";
+        searchInput.placeholder = "🔍 文件名筛选...";
+        searchInput.style.cssText = "flex:1;padding:4px 8px;background:#1a1a1a;color:#eee;border:1px solid #444;border-radius:3px;font-size:12px;";
+        toolbar.appendChild(searchInput);
+
+        dlg.appendChild(toolbar);
+
+        // 队列内文件路径集合 (用于 in_queue 标记)
+        const queuePathSet = new Set(videos.filter(v => v.in_queue).map(v => v.video_path));
+
+        // 列表容器 (可滚)
+        const listWrap = document.createElement("div");
+        listWrap.style.cssText = "flex:1;overflow-y:auto;border:1px solid #444;border-radius:4px;padding:6px;background:#1f1f1f;";
+        dlg.appendChild(listWrap);
+
+        // 渲染函数 (响应过滤变化)
+        const render = () => {
+            listWrap.innerHTML = "";
+            const filterTarget = filterCb.checked;
+            const search = searchInput.value.trim().toLowerCase();
+            let shown = 0;
+
+            videos.forEach((v) => {
+                const isTgt = isTarget(v);
+                if (filterTarget && !isTgt) return;
+                if (search && !(v.video_basename || "").toLowerCase().includes(search)) return;
+                shown++;
+
+                const seg = (v.queue_segment !== undefined && v.queue_segment !== null)
+                    ? `#${v.queue_segment}` : "";
+                const time = _formatTime(v.mtime);
+                const fname = v.video_basename || (v.video_path || "").split(/[\/\\]/).pop() || "?";
+                const sizeMB = v.size_bytes ? (v.size_bytes / (1024*1024)).toFixed(1) + "MB" : "?";
+
+                const resColor = isTgt ? "#9c9" : "#c96";
+                const resBadge = isTgt
+                    ? `<span style="color:${resColor};font-weight:bold">★ ${v.resolution}</span>`
+                    : `<span style="color:${resColor}">${v.resolution}</span>`;
+                const queueBadge = v.in_queue
+                    ? `<span style="color:#9cf;background:#234;padding:1px 5px;border-radius:3px;margin-left:4px">📜 队列${seg}</span>`
+                    : "";
+
+                const b = document.createElement("button");
+                b.innerHTML =
+                    `<span style="color:#eee;font-weight:bold">${fname}</span>  ` +
+                    resBadge + `  ` +
+                    `<span style="color:#888">${time}</span>  ` +
+                    `<span style="color:#666">${sizeMB}</span>` +
+                    queueBadge;
+                b.title = v.video_path || "";
+                b.style.cssText = `display:block;width:100%;margin:3px 0;padding:8px 10px;` +
+                    `background:#3a3a3a;color:#eee;border:1px solid #555;border-radius:4px;` +
+                    `text-align:left;cursor:pointer;font-family:monospace;font-size:12px;`;
                 b.onmouseenter = () => b.style.background = "#4a4a4a";
                 b.onmouseleave = () => b.style.background = "#3a3a3a";
                 b.onclick = () => { document.body.removeChild(overlay); resolve(v.video_path); };
-            }
-            dlg.appendChild(b);
-        });
+                listWrap.appendChild(b);
+            });
 
+            if (shown === 0) {
+                const empty = document.createElement("div");
+                empty.textContent = "(没有匹配的视频)";
+                empty.style.cssText = "color:#888;text-align:center;padding:20px;";
+                listWrap.appendChild(empty);
+            }
+        };
+        filterCb.onchange = render;
+        searchInput.oninput = render;
+        render();
+
+        // 底部
+        const btnBar = document.createElement("div");
+        btnBar.style.cssText = "display:flex;gap:8px;margin-top:10px;";
         const cancel = document.createElement("button");
         cancel.textContent = "取消";
-        cancel.style.cssText = "display:block;width:100%;margin-top:10px;padding:8px;background:#5a2a2a;color:#fff;border:1px solid #7a4a4a;border-radius:4px;cursor:pointer;";
+        cancel.style.cssText = "flex:1;padding:8px;background:#5a2a2a;color:#fff;border:1px solid #7a4a4a;border-radius:4px;cursor:pointer;";
         cancel.onclick = () => { document.body.removeChild(overlay); resolve(null); };
-        dlg.appendChild(cancel);
+        btnBar.appendChild(cancel);
+        dlg.appendChild(btnBar);
 
         overlay.appendChild(dlg);
         overlay.onclick = (e) => { if (e.target === overlay) { document.body.removeChild(overlay); resolve(null); } };
         document.body.appendChild(overlay);
+
+        // 自动 focus 搜索框, 方便键盘筛选
+        setTimeout(() => searchInput.focus(), 50);
     });
 }
 
@@ -280,6 +365,13 @@ async function registerLastVideo(node, segmentIndex, firstFilename, lastFilename
     const tw = m ? parseInt(m[1]) : 1920;
     const th = m ? parseInt(m[2]) : 1088;
 
+    // 默认开启分辨率过滤 (用来过滤掉一次工作流里同时输出的预览版),
+    // 用户可在 widget "register_only_target_res" 上关掉
+    const filterW = getWidget(node, "register_only_target_res");
+    const onlyTargetRes = (filterW === undefined || filterW === null)
+        ? true
+        : !!filterW.value;
+
     try {
         const res = await fetch(ENDPOINT_REGISTER, {
             method: "POST",
@@ -293,6 +385,7 @@ async function registerLastVideo(node, segmentIndex, firstFilename, lastFilename
                 segment_index: segmentIndex,
                 first_filename: firstFilename || "",
                 last_filename: lastFilename || "",
+                only_target_res: onlyTargetRes,
             }),
         });
         return await res.json();
@@ -305,6 +398,24 @@ async function listVideos(node) {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ controller_id: String(node.id) }),
+        });
+        return await res.json();
+    } catch (e) { return { ok: false, error: String(e), videos: [] }; }
+}
+
+// 直接扫磁盘列出 output_dir 下的视频 (用于 🎞 选视频抽尾帧)
+async function listDirVideos(node, maxCount = 60) {
+    const outDir = (getWidget(node, "output_dir")?.value || "").trim();
+    try {
+        const res = await fetch(ENDPOINT_LIST_DIR, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                controller_id: String(node.id),
+                output_dir: outDir,
+                max_count: maxCount,
+                since_timestamp: 0,
+            }),
         });
         return await res.json();
     } catch (e) { return { ok: false, error: String(e), videos: [] }; }
@@ -617,8 +728,8 @@ app.registerExtension({
                 await applyTailPair(this);
             });
 
-            this.addWidget("button", "🎞 选视频抽尾帧（手动指定）", null, async () => {
-                // 弹出本会话已登记视频列表，选一个就用它的尾帧覆盖到首帧槽位
+            this.addWidget("button", "🎞 选视频抽尾帧（从 output_dir）", null, async () => {
+                // 直接扫 output_dir 磁盘列出全部视频, 选一个就用它的尾帧覆盖到首帧槽位
                 // 尾帧槽位仍按目录里的下一张目标关键帧覆盖
                 const videoPath = await pickVideoDialog(this, "选一段视频抽尾帧 → 覆盖到首帧槽位");
                 if (!videoPath) return;
@@ -815,6 +926,13 @@ app.registerExtension({
                         console.log(
                             `[AutoSeq Ctrl] 登记视频 ✓ #${reg.registered?.segment_index} ` +
                             `${reg.registered?.video_basename}  队列长度=${reg.queue_length}`
+                        );
+                    } else if (reg.skipped_reason === "no_target_res_match") {
+                        // 这是预期内情况: 一次工作流出多个分辨率, 终版还没出来
+                        // 或者用户改了 target_resolution 但工作流没改
+                        console.log(
+                            `[AutoSeq Ctrl] 登记视频跳过 (没找到目标分辨率视频): ${reg.error}\n` +
+                            `  → 可在节点上把 register_only_target_res 关掉, 改为登记最新视频`
                         );
                     } else {
                         console.warn(`[AutoSeq Ctrl] 登记视频失败 (不影响后续): ${reg.error}`);
