@@ -1,20 +1,40 @@
-版本: v4-tail-frame-mode
-日期: 2026-05-01
-特性: 新增「尾帧模式」(tail_frame_mode)
+版本: v5-history-and-rewind
+日期: 2026-05-02
+特性: 视频历史管理 + 上一对回退 + 手动选视频抽尾帧
+
 关键改动:
-  - Controller 节点新增 3 个 widget: tail_frame_mode / output_dir / target_resolution
-  - 后端新增 /auto_sequential/extract_tail_frame 接口 (cv2 抽帧)
-  - 前端 execution_success 时，开了尾帧模式则用上一段视频末帧覆盖首帧槽位
-  - 默认按 1920x1088 过滤视频，自动跳过中间预览/低分辨率版本
-  - 新增按钮 "🔁 应用尾帧对" 用于手动调试
+  - 后端新增视频历史持久化 (~/user/auto_sequential_history.json)，按 controller_id 隔离
+  - 后端新增 4 个接口:
+      /auto_sequential/register_video    每次执行成功后登记刚生成的视频
+      /auto_sequential/list_videos       列出某节点的视频队列 (含 exists 标记)
+      /auto_sequential/pop_last_video    弹出队列尾 (用于「上一对」回退)
+      /auto_sequential/clear_history     清空某节点(或全部)历史
+  - 后端 /auto_sequential/extract_tail_frame 接口加 video_path 参数:
+      传了就直接抽指定视频的末帧；不传则保留原扫盘自动选最新行为
+  - 前端 execution_success 时先调 register_video 把刚跑出的视频进队列
+  - 前端新增 4 个按钮:
+      ⬅ 上一对 (回退一段视频) — current_index -= step + 弹掉队列尾 + 用「现在的队尾」抽尾帧
+      🎞 选视频抽尾帧 (手动指定) — 弹出本会话视频列表，点一个就用它的末帧覆盖首帧槽位
+      📜 查看视频历史
+      🗑 清空视频历史
+  - 修复: ⏭ 跳过当前对 在尾帧模式下现在会用最近一段视频的末帧作首帧
+         (旧行为是不管尾帧模式总是从目录取，会破坏视频链接续)
+  - 修复: 🔁 应用尾帧对 按钮内 node._sessionStartTime 误用 (应为 this)
+
 依赖:
   - opencv-python (尾帧模式需要; 99% 的 ComfyUI 环境自带)
+
 向后兼容:
-  - tail_frame_mode 默认 False, 旧工作流加载后行为完全不变
+  - 所有旧按钮行为不变
+  - 历史文件不存在时正常工作 (空队列)
+  - 加载老工作流不需要任何手动迁移
 
 历史版本:
+  v4-tail-frame-mode (2026-05-01)
+    - 新增「尾帧模式」(tail_frame_mode)
+    - Controller 节点新增 3 个 widget
+    - 后端 /auto_sequential/extract_tail_frame 接口 (cv2 抽帧)
+    - 前端 execution_success 时自动用上一段视频末帧覆盖首帧槽位
   v3-overlay-mode (2026-05-01)
     - 覆盖式上传模式 (不修改 LoadImage 的 widget 值)
     - 后端 /auto_sequential/inject 接口 (shutil.copyfile)
-    - 前端不再调用 setWidgetValue 改 LoadImage
-    - 通过覆盖 input/<占位文件名> 的内容实现切图

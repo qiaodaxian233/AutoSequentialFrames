@@ -16,7 +16,10 @@ v4 新增「尾帧模式」(tail_frame_mode)：
 
 import os
 import re
+import json
+import time
 import fnmatch
+import threading
 import torch
 import numpy as np
 from PIL import Image, ImageOps
@@ -27,6 +30,144 @@ try:
     _HAS_SERVER = True
 except Exception:
     _HAS_SERVER = False
+
+
+# ==========================================================================
+# 视频历史管理 (Session Videos)
+# ==========================================================================
+# 维护一个「本会话生成的视频」队列 (按 controller_id 分组)，每次执行成功
+# 后由前端调 /auto_sequential/register_video 把刚生成的视频登记进来。
+# 这样:
+#   1) 「上一对」回退时知道用「倒数第二段视频」的尾帧
+#   2) 「选择视频抽尾帧」可以列出本会话所有候选视频
+#   3) 「跳过当前对」在尾帧模式下知道接最近一段已生成视频
+# 持久化到磁盘，重启 ComfyUI 仍然在；提供 /clear_history 清空。
+# --------------------------------------------------------------------------
+
+_HISTORY_LOCK = threading.Lock()
+
+
+def _get_history_path():
+    """历史文件路径: ComfyUI/user/auto_sequential_history.json (回退到本插件目录)。"""
+    try:
+        import folder_paths
+        # ComfyUI 0.3+: get_user_directory()
+        user_dir = None
+        if hasattr(folder_paths, "get_user_directory"):
+            try:
+                user_dir = folder_paths.get_user_directory()
+            except Exception:
+                user_dir = None
+        if not user_dir:
+            # 老版本 ComfyUI: 用 base_path/user
+            base = getattr(folder_paths, "base_path", None)
+            if base:
+                user_dir = os.path.join(base, "user")
+        if user_dir and os.path.isdir(user_dir):
+            return os.path.join(user_dir, "auto_sequential_history.json")
+    except Exception:
+        pass
+    # 兜底：放在本文件同级目录
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        ".auto_sequential_history.json")
+
+
+def _load_history():
+    """读取整张历史表。返回 dict: {controller_id: [video_entry, ...]}。"""
+    path = _get_history_path()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        # 兼容性清理：每个值必须是 list
+        return {k: v for k, v in data.items() if isinstance(v, list)}
+    except Exception as e:
+        print(f"[AutoSeq] 读取历史失败 (将以空历史启动): {e}")
+        return {}
+
+
+def _save_history(history: dict):
+    path = _get_history_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+    try:
+        # 写入临时文件再 rename，避免写到一半崩溃留下损坏文件
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"[AutoSeq] 保存历史失败: {e}")
+
+
+def _history_get_list(controller_id: str):
+    """读取某个 controller 的视频队列 (拷贝)。"""
+    if not controller_id:
+        return []
+    with _HISTORY_LOCK:
+        h = _load_history()
+        return list(h.get(str(controller_id), []))
+
+
+def _history_set_list(controller_id: str, videos: list):
+    if not controller_id:
+        return
+    with _HISTORY_LOCK:
+        h = _load_history()
+        h[str(controller_id)] = list(videos)
+        _save_history(h)
+
+
+def _history_append(controller_id: str, entry: dict):
+    """把一条视频记录追加到某个 controller 的队列尾。"""
+    if not controller_id:
+        return
+    with _HISTORY_LOCK:
+        h = _load_history()
+        lst = h.get(str(controller_id))
+        if not isinstance(lst, list):
+            lst = []
+        # 去重：同一个 video_path 只保留最新一条 (覆盖式)
+        path = entry.get("video_path", "")
+        if path:
+            lst = [v for v in lst if v.get("video_path") != path]
+        lst.append(entry)
+        # 限制最多保留 200 条，避免无限增长
+        if len(lst) > 200:
+            lst = lst[-200:]
+        h[str(controller_id)] = lst
+        _save_history(h)
+
+
+def _history_pop(controller_id: str):
+    """弹出最末尾的一条记录 (用于「上一对」回退时清理当前段)。返回被弹出的条目或 None。"""
+    if not controller_id:
+        return None
+    with _HISTORY_LOCK:
+        h = _load_history()
+        lst = h.get(str(controller_id))
+        if not isinstance(lst, list) or not lst:
+            return None
+        popped = lst.pop()
+        h[str(controller_id)] = lst
+        _save_history(h)
+        return popped
+
+
+def _history_clear(controller_id: str = None):
+    """清空某个 controller 的历史；不传 controller_id 则清空全部。"""
+    with _HISTORY_LOCK:
+        h = _load_history()
+        if controller_id is None:
+            h = {}
+        else:
+            h.pop(str(controller_id), None)
+        _save_history(h)
 
 
 # ---------- 工具函数 ----------
@@ -775,29 +916,25 @@ if _HAS_SERVER:
     @PromptServer.instance.routes.post("/auto_sequential/extract_tail_frame")
     async def _extract_tail_frame_endpoint(request):
         """
-        【尾帧模式核心】扫描 output 目录里最新的、分辨率匹配的视频，
-        把它的最后一帧提取出来，直接覆盖写入 input/<dst_filename>，
-        让目标 LoadImage 自动重新加载（基于文件 SHA256 的 IS_CHANGED）。
+        【尾帧模式核心】把指定视频(或扫描 output/ 自动找出的最新匹配视频)的
+        最后一帧覆盖写入 input/<dst_filename>。LoadImage 基于文件 SHA256 的
+        IS_CHANGED 会自动重新加载。
 
-        请求体:
+        请求体（两种调用方式）:
+
+        方式 A — 直接指定视频路径 (推荐，「选视频抽尾帧」/「上一对」用)
+        {
+          "video_path":   "D:/.../xxx.mp4"  (绝对路径)
+          "dst_filename": "00115-1.jpg"
+        }
+
+        方式 B — 扫盘自动选最新匹配的 (兼容老逻辑)
         {
           "output_dir":      "..." (留空则用 ComfyUI 默认 output 目录),
           "target_width":    1920,
           "target_height":   1088,
           "since_timestamp": 1700000000.0  (留 0 表示不过滤 mtime),
-          "dst_filename":    "00115-1.jpg" (input/ 下的目标文件名)
-        }
-
-        响应:
-        {
-          "ok": true/false,
-          "video_path": "...",
-          "video_mtime": 1700000123.4,
-          "video_resolution": "1920x1088",
-          "dst_full": "...",
-          "dst_filename": "...",
-          "candidates": [...]  (前 5 个候选，方便调试),
-          "error": ""
+          "dst_filename":    "00115-1.jpg"
         }
         """
         try:
@@ -808,6 +945,66 @@ if _HAS_SERVER:
             if not isinstance(data, dict):
                 data = {}
 
+            dst_filename = (data.get("dst_filename") or "").strip()
+            if not dst_filename:
+                return web.json_response({"ok": False, "error": "dst_filename 为空"})
+
+            # 解析 dst_filename 到 input/ 下 (两种模式共用)
+            try:
+                import folder_paths
+                input_dir = os.path.abspath(folder_paths.get_input_directory())
+            except Exception as e:
+                return web.json_response(
+                    {"ok": False, "error": f"无法获取 input 目录: {e}"})
+
+            dst_clean = dst_filename.replace("\\", "/").lstrip("/")
+            dst_full = os.path.abspath(os.path.join(input_dir, dst_clean))
+            if not _is_under(dst_full, input_dir):
+                return web.json_response({
+                    "ok": False,
+                    "error": f"dst_filename 必须在 input/ 下: {dst_filename} → {dst_full}",
+                })
+
+            # ---------- 方式 A: 直接指定 video_path ----------
+            explicit_path = (data.get("video_path") or "").strip()
+            if explicit_path:
+                explicit_path = os.path.expanduser(explicit_path)
+                if not os.path.isfile(explicit_path):
+                    return web.json_response({
+                        "ok": False,
+                        "error": f"指定的视频不存在: {explicit_path}",
+                    })
+                vw, vh = _get_video_resolution(explicit_path)
+                try:
+                    video_mtime = os.path.getmtime(explicit_path)
+                except OSError:
+                    video_mtime = 0.0
+
+                try:
+                    _extract_video_last_frame(explicit_path, dst_full)
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    return web.json_response(
+                        {"ok": False, "error": f"提取最后一帧失败: {e}"})
+
+                print(
+                    f"[AutoSeq] 尾帧抽取(指定): {os.path.basename(explicit_path)} "
+                    f"({vw}x{vh}) → input/{dst_clean}"
+                )
+                return web.json_response({
+                    "ok": True,
+                    "video_path": explicit_path,
+                    "video_mtime": video_mtime,
+                    "video_resolution": f"{vw}x{vh}",
+                    "dst_full": dst_full,
+                    "dst_filename": dst_filename,
+                    "candidates": [],
+                    "mode": "explicit",
+                    "error": "",
+                })
+
+            # ---------- 方式 B: 扫盘自动选 ----------
             output_dir = (data.get("output_dir") or "").strip()
             try:
                 target_w = int(data.get("target_width") or 1920)
@@ -818,12 +1015,7 @@ if _HAS_SERVER:
                 since_ts = float(data.get("since_timestamp") or 0)
             except (TypeError, ValueError):
                 since_ts = 0.0
-            dst_filename = (data.get("dst_filename") or "").strip()
 
-            if not dst_filename:
-                return web.json_response({"ok": False, "error": "dst_filename 为空"})
-
-            # 默认用 ComfyUI 的 output 目录
             if not output_dir:
                 try:
                     import folder_paths
@@ -837,7 +1029,6 @@ if _HAS_SERVER:
                 return web.json_response(
                     {"ok": False, "error": f"output 目录不存在: {output_dir}"})
 
-            # 扫描 since_ts 之后写入的所有视频（已按 mtime 从新到旧排序）
             videos = _scan_videos(output_dir, since_mtime=since_ts)
             if not videos:
                 return web.json_response({
@@ -848,10 +1039,9 @@ if _HAS_SERVER:
                     ),
                 })
 
-            # 在候选里找第一个分辨率匹配的（最新的）
             candidates = []
             matched = None
-            for path, mtime in videos[:20]:  # 最多看 20 个，避免目录里视频太多时太慢
+            for path, mtime in videos[:20]:
                 w, h = _get_video_resolution(path)
                 candidates.append({
                     "path": path,
@@ -877,24 +1067,6 @@ if _HAS_SERVER:
 
             video_path, video_mtime, vw, vh = matched
 
-            # 解析 dst 到 input/ 下
-            try:
-                import folder_paths
-                input_dir = os.path.abspath(folder_paths.get_input_directory())
-            except Exception as e:
-                return web.json_response(
-                    {"ok": False, "error": f"无法获取 input 目录: {e}"})
-
-            dst_clean = dst_filename.replace("\\", "/").lstrip("/")
-            dst_full = os.path.abspath(os.path.join(input_dir, dst_clean))
-
-            if not _is_under(dst_full, input_dir):
-                return web.json_response({
-                    "ok": False,
-                    "error": f"dst_filename 必须在 input/ 下: {dst_filename} → {dst_full}",
-                })
-
-            # 提取最后一帧并写入到 input/<dst_filename>
             try:
                 _extract_video_last_frame(video_path, dst_full)
             except Exception as e:
@@ -904,9 +1076,8 @@ if _HAS_SERVER:
                     {"ok": False, "error": f"提取最后一帧失败: {e}"})
 
             print(
-                f"[AutoSeq] 尾帧抽取: {os.path.basename(video_path)} "
-                f"({vw}x{vh}, mtime={video_mtime:.1f}) "
-                f"→ input/{dst_clean}"
+                f"[AutoSeq] 尾帧抽取(扫盘): {os.path.basename(video_path)} "
+                f"({vw}x{vh}, mtime={video_mtime:.1f}) → input/{dst_clean}"
             )
 
             return web.json_response({
@@ -917,8 +1088,233 @@ if _HAS_SERVER:
                 "dst_full": dst_full,
                 "dst_filename": dst_filename,
                 "candidates": candidates[:5],
+                "mode": "scan",
                 "error": "",
             })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return web.json_response(
+                {"ok": False, "error": f"{type(e).__name__}: {e}"},
+                status=200,
+            )
+
+    # ============================================================
+    # 视频历史接口：登记 / 列出 / 弹出 / 清空
+    # ============================================================
+
+    @PromptServer.instance.routes.post("/auto_sequential/register_video")
+    async def _register_video_endpoint(request):
+        """
+        每次执行成功后由前端调用：扫 output/ 找最新的、分辨率匹配的视频，
+        登记进 controller_id 对应的视频队列。
+
+        请求体:
+        {
+          "controller_id":   "12",
+          "output_dir":      "..." (留空则用 ComfyUI 默认),
+          "target_width":    1920,
+          "target_height":   1088,
+          "since_timestamp": 1700000000.0,
+          "segment_index":   3,                # 链条第几段，前端记
+          "first_filename":  "frame_003.jpg",  # 这一段用的首帧目录文件名
+          "last_filename":   "frame_004.jpg"   # 尾帧
+        }
+
+        响应:
+        {
+          "ok": true,
+          "registered": {video_path, mtime, resolution, segment_index, ...},
+          "queue_length": 5,
+          "error": ""
+        }
+        """
+        try:
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+
+            controller_id = str(data.get("controller_id") or "").strip()
+            if not controller_id:
+                return web.json_response({"ok": False, "error": "controller_id 为空"})
+
+            output_dir = (data.get("output_dir") or "").strip()
+            try:
+                target_w = int(data.get("target_width") or 1920)
+                target_h = int(data.get("target_height") or 1088)
+            except (TypeError, ValueError):
+                target_w, target_h = 1920, 1088
+            try:
+                since_ts = float(data.get("since_timestamp") or 0)
+            except (TypeError, ValueError):
+                since_ts = 0.0
+
+            if not output_dir:
+                try:
+                    import folder_paths
+                    output_dir = folder_paths.get_output_directory()
+                except Exception as e:
+                    return web.json_response(
+                        {"ok": False, "error": f"无法获取 output 目录: {e}"})
+
+            output_dir = os.path.expanduser(output_dir)
+            if not os.path.isdir(output_dir):
+                return web.json_response(
+                    {"ok": False, "error": f"output 目录不存在: {output_dir}"})
+
+            videos = _scan_videos(output_dir, since_mtime=since_ts)
+            if not videos:
+                return web.json_response({
+                    "ok": False,
+                    "error": f"未在 {output_dir} 找到 since_timestamp={since_ts} 之后的视频",
+                })
+
+            matched = None
+            for path, mtime in videos[:20]:
+                w, h = _get_video_resolution(path)
+                if w == target_w and h == target_h:
+                    matched = (path, mtime, w, h)
+                    break
+
+            if not matched:
+                return web.json_response({
+                    "ok": False,
+                    "error": f"未找到 {target_w}x{target_h} 分辨率的最近视频",
+                })
+
+            video_path, video_mtime, vw, vh = matched
+
+            entry = {
+                "video_path": video_path,
+                "video_basename": os.path.basename(video_path),
+                "mtime": video_mtime,
+                "resolution": f"{vw}x{vh}",
+                "segment_index": data.get("segment_index"),
+                "first_filename": data.get("first_filename") or "",
+                "last_filename": data.get("last_filename") or "",
+                "registered_at": time.time(),
+            }
+            _history_append(controller_id, entry)
+
+            queue = _history_get_list(controller_id)
+            print(
+                f"[AutoSeq] 登记视频 ctrl={controller_id} "
+                f"#{entry.get('segment_index')} {entry['video_basename']} "
+                f"({entry['resolution']})  队列长度={len(queue)}"
+            )
+
+            return web.json_response({
+                "ok": True,
+                "registered": entry,
+                "queue_length": len(queue),
+                "error": "",
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return web.json_response(
+                {"ok": False, "error": f"{type(e).__name__}: {e}"},
+                status=200,
+            )
+
+    @PromptServer.instance.routes.post("/auto_sequential/list_videos")
+    async def _list_videos_endpoint(request):
+        """
+        列出某个 controller 已登记的视频队列。
+
+        请求体: { "controller_id": "12" }
+        响应: { "ok": true, "videos": [...], "count": 5 }
+
+        每个 video 项还会包含 exists 字段，标记文件是否还在磁盘上
+        (用户可能手动删了)。
+        """
+        try:
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            controller_id = str(data.get("controller_id") or "").strip()
+            if not controller_id:
+                return web.json_response({"ok": True, "videos": [], "count": 0})
+
+            videos = _history_get_list(controller_id)
+            for v in videos:
+                p = v.get("video_path", "")
+                v["exists"] = bool(p) and os.path.isfile(p)
+
+            return web.json_response({
+                "ok": True,
+                "videos": videos,
+                "count": len(videos),
+                "error": "",
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return web.json_response(
+                {"ok": False, "error": f"{type(e).__name__}: {e}", "videos": []},
+                status=200,
+            )
+
+    @PromptServer.instance.routes.post("/auto_sequential/pop_last_video")
+    async def _pop_last_video_endpoint(request):
+        """
+        从某个 controller 的视频队列尾弹出最后一条 (用于「上一对」回退)。
+
+        请求体: { "controller_id": "12" }
+        响应: { "ok": true, "popped": {...} | null, "queue_length": 4 }
+        """
+        try:
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            controller_id = str(data.get("controller_id") or "").strip()
+            if not controller_id:
+                return web.json_response({"ok": False, "error": "controller_id 为空"})
+
+            popped = _history_pop(controller_id)
+            queue = _history_get_list(controller_id)
+            return web.json_response({
+                "ok": True,
+                "popped": popped,
+                "queue_length": len(queue),
+                "error": "",
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return web.json_response(
+                {"ok": False, "error": f"{type(e).__name__}: {e}"},
+                status=200,
+            )
+
+    @PromptServer.instance.routes.post("/auto_sequential/clear_history")
+    async def _clear_history_endpoint(request):
+        """
+        清空某个 controller 的视频历史 (不传 controller_id 则清空全部)。
+
+        请求体: { "controller_id": "12" }    或    {}    清全部
+        响应: { "ok": true }
+        """
+        try:
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            controller_id = (data.get("controller_id") or "").strip() or None
+            _history_clear(controller_id)
+            print(f"[AutoSeq] 清空视频历史: ctrl={controller_id or '<all>'}")
+            return web.json_response({"ok": True, "error": ""})
         except Exception as e:
             import traceback
             traceback.print_exc()

@@ -15,10 +15,14 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 const NODE_TYPE = "AutoSequentialController";
-const ENDPOINT_SCAN   = "/auto_sequential/scan";
-const ENDPOINT_INJECT = "/auto_sequential/inject";
-const ENDPOINT_LINK   = "/auto_sequential/link";
-const ENDPOINT_TAIL   = "/auto_sequential/extract_tail_frame";
+const ENDPOINT_SCAN     = "/auto_sequential/scan";
+const ENDPOINT_INJECT   = "/auto_sequential/inject";
+const ENDPOINT_LINK     = "/auto_sequential/link";
+const ENDPOINT_TAIL     = "/auto_sequential/extract_tail_frame";
+const ENDPOINT_REGISTER = "/auto_sequential/register_video";
+const ENDPOINT_LIST     = "/auto_sequential/list_videos";
+const ENDPOINT_POP      = "/auto_sequential/pop_last_video";
+const ENDPOINT_CLEAR    = "/auto_sequential/clear_history";
 
 const executedThisRun = new Set();
 
@@ -97,7 +101,7 @@ async function pickLoadImageDialog(title) {
             dlg.appendChild(b);
         }
         const inp = document.createElement("input");
-        inp.placeholder = "或直接输入 ID（如 97，或 129/97）";
+        inp.placeholder = "或直接输入 ID（如 97,或 129/97）";
         inp.style.cssText = "width:100%;margin-top:10px;padding:8px;background:#1a1a1a;color:#fff;border:1px solid #555;border-radius:4px;";
         dlg.appendChild(inp);
         const okBtn = document.createElement("button");
@@ -114,6 +118,83 @@ async function pickLoadImageDialog(title) {
         overlay.onclick = (e) => { if (e.target === overlay) { document.body.removeChild(overlay); resolve(null); } };
         document.body.appendChild(overlay);
         inp.focus();
+    });
+}
+
+// ---------- 选视频弹窗（用于「选视频抽尾帧」）----------
+
+function _formatTime(unixSec) {
+    if (!unixSec) return "?";
+    try {
+        const d = new Date(unixSec * 1000);
+        const pad = (n) => String(n).padStart(2, "0");
+        return `${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    } catch (e) { return "?"; }
+}
+
+async function pickVideoDialog(node, title) {
+    const resp = await listVideos(node);
+    if (!resp.ok) { alert("读取视频历史失败: " + (resp.error || "?")); return null; }
+    const videos = resp.videos || [];
+    if (videos.length === 0) {
+        alert("本会话还没有登记过视频。\n先点 ▶ 立即开始 跑一段视频，或者用「应用尾帧对」走一次扫盘流程。");
+        return null;
+    }
+
+    return new Promise((resolve) => {
+        const overlay = document.createElement("div");
+        overlay.style.cssText = `position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:9999;display:flex;align-items:center;justify-content:center;`;
+        const dlg = document.createElement("div");
+        dlg.style.cssText = `background:#2a2a2a;color:#fff;padding:20px;border-radius:8px;border:1px solid #555;min-width:520px;max-width:80vw;max-height:75vh;overflow-y:auto;font-family:sans-serif;font-size:13px;`;
+        const h = document.createElement("h3");
+        h.textContent = title || "选一段视频抽尾帧";
+        h.style.cssText = "margin:0 0 6px 0;font-size:15px;";
+        dlg.appendChild(h);
+
+        const sub = document.createElement("div");
+        sub.textContent = `本会话已登记 ${videos.length} 段视频（最新的在最下面）`;
+        sub.style.cssText = "color:#aaa;font-size:11px;margin-bottom:10px;";
+        dlg.appendChild(sub);
+
+        // 倒序展示：最新的在上面更易点
+        const list = videos.slice().reverse();
+        list.forEach((v, idx) => {
+            const seg = (v.segment_index !== undefined && v.segment_index !== null)
+                ? `#${v.segment_index}` : "";
+            const exists = !!v.exists;
+            const b = document.createElement("button");
+            const time = _formatTime(v.mtime);
+            const fname = v.video_basename || (v.video_path || "").split(/[\/\\]/).pop() || "?";
+            const pair = (v.first_filename || v.last_filename)
+                ? ` ⟵ (${v.first_filename || "?"} → ${v.last_filename || "?"})`
+                : "";
+            b.innerHTML = (exists ? "" : "🚫 ") +
+                `<b>${seg}</b>  ${fname}  <span style="color:#9c9">${v.resolution || ""}</span>  ` +
+                `<span style="color:#888">${time}</span>` +
+                `<span style="color:#777;font-size:11px">${pair}</span>`;
+            b.disabled = !exists;
+            b.title = v.video_path || "";
+            b.style.cssText = `display:block;width:100%;margin:4px 0;padding:8px 10px;` +
+                `background:${exists ? '#3a3a3a' : '#2a1a1a'};color:${exists ? '#eee' : '#888'};` +
+                `border:1px solid #555;border-radius:4px;text-align:left;` +
+                `cursor:${exists ? 'pointer' : 'not-allowed'};font-family:monospace;font-size:12px;`;
+            if (exists) {
+                b.onmouseenter = () => b.style.background = "#4a4a4a";
+                b.onmouseleave = () => b.style.background = "#3a3a3a";
+                b.onclick = () => { document.body.removeChild(overlay); resolve(v.video_path); };
+            }
+            dlg.appendChild(b);
+        });
+
+        const cancel = document.createElement("button");
+        cancel.textContent = "取消";
+        cancel.style.cssText = "display:block;width:100%;margin-top:10px;padding:8px;background:#5a2a2a;color:#fff;border:1px solid #7a4a4a;border-radius:4px;cursor:pointer;";
+        cancel.onclick = () => { document.body.removeChild(overlay); resolve(null); };
+        dlg.appendChild(cancel);
+
+        overlay.appendChild(dlg);
+        overlay.onclick = (e) => { if (e.target === overlay) { document.body.removeChild(overlay); resolve(null); } };
+        document.body.appendChild(overlay);
     });
 }
 
@@ -155,19 +236,22 @@ async function createLink(srcPath) {
     } catch (e) { return { ok: false, error: String(e) }; }
 }
 
-// 尾帧模式：让后端去 output/ 找最新的、分辨率匹配的视频，
-// 抽出最后一帧，直接覆盖写入 input/<dstFilename>
-async function extractTailFrameToSlot(node, dstFilename, sinceTimestamp) {
+// 尾帧模式：抽某段视频的最后一帧 → 覆盖写入 input/<dstFilename>
+//
+// 两种调用：
+//   ① 不传 explicitVideoPath → 后端按 since_timestamp + target_resolution 自动找最新匹配
+//   ② 传 explicitVideoPath → 直接用指定视频 (用于「选视频抽尾帧」「上一对」回退)
+async function extractTailFrameToSlot(node, dstFilename, sinceTimestamp, explicitVideoPath = "") {
     const targetRes = (getWidget(node, "target_resolution")?.value || "1920x1088").trim();
     const outDir = (getWidget(node, "output_dir")?.value || "").trim();
 
     // 解析 "1920x1088" / "1920*1088" / "1920×1088"
     const m = targetRes.match(/(\d+)\s*[xX*×]\s*(\d+)/);
-    if (!m) {
+    if (!m && !explicitVideoPath) {
         return { ok: false, error: `target_resolution 格式无效: ${targetRes}（应为 "1920x1088" 这种）` };
     }
-    const tw = parseInt(m[1]);
-    const th = parseInt(m[2]);
+    const tw = m ? parseInt(m[1]) : 0;
+    const th = m ? parseInt(m[2]) : 0;
 
     try {
         const res = await fetch(ENDPOINT_TAIL, {
@@ -179,12 +263,73 @@ async function extractTailFrameToSlot(node, dstFilename, sinceTimestamp) {
                 target_height: th,
                 since_timestamp: sinceTimestamp || 0,
                 dst_filename: dstFilename,
+                video_path: explicitVideoPath || "",
             }),
         });
         return await res.json();
     } catch (e) {
         return { ok: false, error: String(e) };
     }
+}
+
+// 视频历史相关 API
+async function registerLastVideo(node, segmentIndex, firstFilename, lastFilename) {
+    const targetRes = (getWidget(node, "target_resolution")?.value || "1920x1088").trim();
+    const outDir = (getWidget(node, "output_dir")?.value || "").trim();
+    const m = targetRes.match(/(\d+)\s*[xX*×]\s*(\d+)/);
+    const tw = m ? parseInt(m[1]) : 1920;
+    const th = m ? parseInt(m[2]) : 1088;
+
+    try {
+        const res = await fetch(ENDPOINT_REGISTER, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                controller_id: String(node.id),
+                output_dir: outDir,
+                target_width: tw,
+                target_height: th,
+                since_timestamp: node._sessionStartTime || 0,
+                segment_index: segmentIndex,
+                first_filename: firstFilename || "",
+                last_filename: lastFilename || "",
+            }),
+        });
+        return await res.json();
+    } catch (e) { return { ok: false, error: String(e) }; }
+}
+
+async function listVideos(node) {
+    try {
+        const res = await fetch(ENDPOINT_LIST, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ controller_id: String(node.id) }),
+        });
+        return await res.json();
+    } catch (e) { return { ok: false, error: String(e), videos: [] }; }
+}
+
+async function popLastVideo(node) {
+    try {
+        const res = await fetch(ENDPOINT_POP, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ controller_id: String(node.id) }),
+        });
+        return await res.json();
+    } catch (e) { return { ok: false, error: String(e) }; }
+}
+
+async function clearHistory(node) {
+    try {
+        const res = await fetch(ENDPOINT_CLEAR, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ controller_id: String(node.id) }),
+        });
+        return await res.json();
+    } catch (e) { return { ok: false, error: String(e) }; }
 }
 
 // ---------- 强制刷新 LoadImage 的预览图（保护节点位置/尺寸不变）----------
@@ -324,8 +469,11 @@ async function applyCurrentPair(node, opts = {}) {
 }
 
 // ---------- 尾帧模式：用上一段视频的最后一帧覆盖首帧槽位，目录里的下一张图覆盖尾帧槽位 ----------
+//
+// opts.explicitVideoPath: 强制使用指定视频抽尾帧 (来自「选视频抽尾帧」/「上一对」)
+//                         不传则按 sinceTimestamp 扫盘自动选最新匹配的
 
-async function applyTailPair(node) {
+async function applyTailPair(node, opts = {}) {
     const data = await scanFor(node);
     if (!data) {
         updateStatus(node, "❌ 扫描失败（看 F12 控制台 + ComfyUI 黑窗口日志）");
@@ -385,8 +533,10 @@ async function applyTailPair(node) {
     }
 
     // 1) 让后端去 output/ 抽尾帧 → 直接写到 input/<slot1>
+    //    如果 opts.explicitVideoPath 给了，就直接用那段视频；否则按 sinceTs 自动选最新匹配
     const sinceTs = node._sessionStartTime || 0;
-    const tailRes = await extractTailFrameToSlot(node, slot1, sinceTs);
+    const explicitPath = opts.explicitVideoPath || "";
+    const tailRes = await extractTailFrameToSlot(node, slot1, sinceTs, explicitPath);
     if (!tailRes.ok) {
         updateStatus(node, `❌ 尾帧抽取失败: ${tailRes.error}`);
         console.warn("[AutoSeq Ctrl] 尾帧抽取失败，候选视频:", tailRes.candidates);
@@ -403,8 +553,9 @@ async function applyTailPair(node) {
 
     const totalPairs = Math.max(0, data.count - step);
     const videoBase = (tailRes.video_path || "").split(/[\/\\]/).pop() || "?";
+    const sourceTag = explicitPath ? "指定" : (tailRes.mode === "explicit" ? "指定" : "扫盘");
     updateStatus(node,
-        `✅ 尾帧模式: [${videoBase} 末帧 → 槽位 ${slot1}]  &  ` +
+        `✅ 尾帧模式[${sourceTag}]: [${videoBase} 末帧 → 槽位 ${slot1}]  &  ` +
         `[${f2} → 槽位 ${slot2}]   进度 ${idx}/${totalPairs}  ` +
         `(${tailRes.video_resolution})`
     );
@@ -415,7 +566,7 @@ async function applyTailPair(node) {
 async function applyForCurrentMode(node, opts = {}) {
     const tailMode = !!getWidget(node, "tail_frame_mode")?.value;
     if (tailMode && !opts.forceFromDirectory) {
-        return applyTailPair(node);
+        return applyTailPair(node, opts);
     }
     return applyCurrentPair(node);
 }
@@ -457,13 +608,94 @@ app.registerExtension({
             this.addWidget("button", "🔁 应用尾帧对（用上一段视频末帧作首帧）", null, async () => {
                 // 手动触发尾帧模式应用：找最新的匹配视频，抽末帧 → 首帧槽位
                 // 适合：① 调试尾帧模式 ② 中途从已有视频继续接力
-                if (!node._sessionStartTime) {
+                if (!this._sessionStartTime) {
                     // 没记录过 session 开始时间，让用户决定是否考虑历史所有视频
-                    if (!confirm("还没有本次会话的执行记录。\n是否扫描 output/ 里的所有历史视频？\n（点取消放弃；点确定将考虑所有历史视频。）")) {
+                    if (!confirm("还没有本次会话的执行记录。\n是否扫描 output/ 里的所有历史视频?\n(点取消放弃；点确定将考虑所有历史视频。)")) {
                         return;
                     }
                 }
                 await applyTailPair(this);
+            });
+
+            this.addWidget("button", "🎞 选视频抽尾帧（手动指定）", null, async () => {
+                // 弹出本会话已登记视频列表，选一个就用它的尾帧覆盖到首帧槽位
+                // 尾帧槽位仍按目录里的下一张目标关键帧覆盖
+                const videoPath = await pickVideoDialog(this, "选一段视频抽尾帧 → 覆盖到首帧槽位");
+                if (!videoPath) return;
+                const tailMode = !!getWidget(this, "tail_frame_mode")?.value;
+                if (!tailMode) {
+                    if (!confirm("当前没开 tail_frame_mode。\n继续会临时按尾帧模式应用一次（首帧 = 选中视频末帧），但 index 不会推进。\n确定?")) return;
+                }
+                await applyTailPair(this, { explicitVideoPath: videoPath });
+            });
+
+            this.addWidget("button", "⬅ 上一对（回退一段视频）", null, async () => {
+                // 沿着视频链回退一格：
+                //   1) current_index -= step
+                //   2) 把队列尾的「当前段视频」弹掉（这段不要了）
+                //   3) 尾帧模式下：用「现在的队列末尾」(原来的倒数第二段) 作首帧；
+                //      正常模式下：directory[new_idx] 作首帧
+                const cur = getWidget(this, "current_index")?.value ?? 0;
+                const step = getWidget(this, "step")?.value ?? 1;
+                if (cur < step) {
+                    updateStatus(this, "⚠️ 已经在起点，无法再回退");
+                    return;
+                }
+                const newIdx = cur - step;
+                setWidgetValue(this, "current_index", newIdx);
+
+                // 队列里弹掉当前段（这段我们不满意，要重做）
+                const popped = await popLastVideo(this);
+                if (popped.ok && popped.popped) {
+                    console.log(`[AutoSeq Ctrl] 弹出当前段: ${popped.popped.video_basename}, 队列剩 ${popped.queue_length}`);
+                }
+
+                const tailMode = !!getWidget(this, "tail_frame_mode")?.value;
+                if (!tailMode) {
+                    // 目录模式：直接按目录取
+                    await applyCurrentPair(this);
+                    return;
+                }
+
+                // 尾帧模式：用「现在的队列末尾」(也就是回退后的「上一段视频」) 抽尾帧
+                const list = await listVideos(this);
+                if (list.ok && list.videos && list.videos.length > 0) {
+                    const prev = list.videos[list.videos.length - 1];
+                    if (prev.exists) {
+                        await applyTailPair(this, { explicitVideoPath: prev.video_path });
+                        return;
+                    }
+                    updateStatus(this, `⚠️ 上一段视频已被删除: ${prev.video_basename}`);
+                }
+                // 队列空了 (回退到链条起点) → 退化成目录模式起步
+                updateStatus(this, "ℹ️ 已回退到起点，从目录取首帧");
+                await applyCurrentPair(this);
+            });
+
+            this.addWidget("button", "📜 查看视频历史", null, async () => {
+                const r = await listVideos(this);
+                if (!r.ok) { alert("读取失败: " + (r.error || "?")); return; }
+                if (!r.videos || r.videos.length === 0) {
+                    alert("本会话还没登记过视频。");
+                    return;
+                }
+                const lines = r.videos.map((v, i) => {
+                    const seg = (v.segment_index !== undefined && v.segment_index !== null) ? `#${v.segment_index}` : "?";
+                    const time = _formatTime(v.mtime);
+                    const ex = v.exists ? "✅" : "🚫";
+                    return `${ex} [${i+1}] ${seg}  ${v.video_basename || "?"}  ${v.resolution || ""}  ${time}`;
+                });
+                alert(`本会话已登记 ${r.videos.length} 段视频:\n\n` + lines.join("\n"));
+            });
+
+            this.addWidget("button", "🗑 清空视频历史", null, async () => {
+                if (!confirm("确定清空本节点已登记的所有视频历史？\n（不会删磁盘上的视频文件，只清空插件的记录）")) return;
+                const r = await clearHistory(this);
+                if (r.ok) {
+                    updateStatus(this, "🗑 视频历史已清空");
+                } else {
+                    alert("清空失败: " + (r.error || "?"));
+                }
             });
 
             this.addWidget("button", "🔗 (可选) 把目录链接进 input/", null, async () => {
@@ -491,11 +723,30 @@ app.registerExtension({
                 if (ok) setTimeout(() => app.queuePrompt(0, 1), 250);
             });
 
-            this.addWidget("button", "⏭ 跳过当前对（仅 +step）", null, () => {
+            this.addWidget("button", "⏭ 跳过当前对（+step）", null, async () => {
+                // 跳过 = 不重新跑当前这段，直接推进。
+                // 尾帧模式下：跳过后下一段的首帧 = 最近一段已生成视频的末帧（队列末尾）
+                //              目录模式下：直接 directory[new_idx] 作首帧
                 const cur = getWidget(this, "current_index")?.value ?? 0;
                 const step = getWidget(this, "step")?.value ?? 1;
                 setWidgetValue(this, "current_index", cur + step);
-                applyCurrentPair(this);
+
+                const tailMode = !!getWidget(this, "tail_frame_mode")?.value;
+                if (!tailMode) {
+                    await applyCurrentPair(this);
+                    return;
+                }
+                // 尾帧模式：拿队列里最新一段视频抽尾帧
+                const list = await listVideos(this);
+                if (list.ok && list.videos && list.videos.length > 0) {
+                    const last = list.videos[list.videos.length - 1];
+                    if (last.exists) {
+                        await applyTailPair(this, { explicitVideoPath: last.video_path });
+                        return;
+                    }
+                }
+                // 队列空 / 视频被删 → 兜底走自动扫盘
+                await applyTailPair(this);
             });
 
             this._statusWidget = this.addWidget(
@@ -526,6 +777,11 @@ app.registerExtension({
                 if (node.type === NODE_TYPE) {
                     // 减 2 秒缓冲，应付 mtime 精度差 / 时钟轻微不同步
                     node._sessionStartTime = now - 2;
+                    // 记录这次跑用的是哪一对图（来自当前 idx），事后登记进队列
+                    const idx = getWidget(node, "current_index")?.value ?? 0;
+                    const step = getWidget(node, "step")?.value ?? 1;
+                    node._lastRunIdx = idx;
+                    node._lastRunStep = step;
                 }
             }
         });
@@ -539,6 +795,33 @@ app.registerExtension({
                 if (!executedThisRun.has(String(node.id))) continue;
 
                 const tailMode = !!getWidget(node, "tail_frame_mode")?.value;
+
+                // ★ 第一步：登记刚刚生成的视频到本节点的视频队列。
+                //   这样后续 ⬅ 上一对 / ⏭ 跳过 / 🎞 选视频抽尾帧都能用上。
+                try {
+                    // 拿这次跑用的首帧/尾帧文件名 (供历史里看是哪一对图)
+                    const scan = await scanFor(node);
+                    let firstFn = "", lastFn = "";
+                    if (scan && scan.exists && scan.files && scan.files.length > 0) {
+                        const idx = node._lastRunIdx ?? 0;
+                        const step = node._lastRunStep ?? 1;
+                        const i1 = idx % scan.count;
+                        const i2 = (idx + step) % scan.count;
+                        firstFn = scan.files[i1] || "";
+                        lastFn = scan.files[i2] || "";
+                    }
+                    const reg = await registerLastVideo(node, node._lastRunIdx, firstFn, lastFn);
+                    if (reg.ok) {
+                        console.log(
+                            `[AutoSeq Ctrl] 登记视频 ✓ #${reg.registered?.segment_index} ` +
+                            `${reg.registered?.video_basename}  队列长度=${reg.queue_length}`
+                        );
+                    } else {
+                        console.warn(`[AutoSeq Ctrl] 登记视频失败 (不影响后续): ${reg.error}`);
+                    }
+                } catch (e) {
+                    console.warn("[AutoSeq Ctrl] register_video 异常:", e);
+                }
 
                 if (!getWidget(node, "auto_advance")?.value) {
                     // 不自动推进 index，但仍按当前模式刷新一下显示
