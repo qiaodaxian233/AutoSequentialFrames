@@ -24,6 +24,9 @@ const ENDPOINT_LIST     = "/auto_sequential/list_videos";
 const ENDPOINT_LIST_DIR = "/auto_sequential/list_dir_videos";
 const ENDPOINT_POP      = "/auto_sequential/pop_last_video";
 const ENDPOINT_CLEAR    = "/auto_sequential/clear_history";
+const ENDPOINT_PROMPTS_LIST   = "/auto_sequential/prompts/list";
+const ENDPOINT_PROMPTS_SAVE   = "/auto_sequential/prompts/save";
+const ENDPOINT_PROMPTS_DELETE = "/auto_sequential/prompts/delete";
 
 const executedThisRun = new Set();
 
@@ -40,6 +43,57 @@ function setWidgetValue(node, name, value) {
         try { w.callback(value); } catch (e) {}
     }
     return true;
+}
+
+// 多分辨率解析: 与后端 _parse_resolution_list 行为一致。
+// 返回 [{w, h}, ...], 空数组表示 "任意分辨率"。
+function parseResolutionList(s) {
+    if (Array.isArray(s)) {
+        const out = [];
+        const seen = new Set();
+        for (const it of s) {
+            if (Array.isArray(it) && it.length >= 2) {
+                const w = parseInt(it[0]) | 0, h = parseInt(it[1]) | 0;
+                if (w > 0 && h > 0) {
+                    const k = `${w}x${h}`;
+                    if (!seen.has(k)) { seen.add(k); out.push({w, h}); }
+                }
+            } else if (typeof it === "string") {
+                for (const p of parseResolutionList(it)) {
+                    const k = `${p.w}x${p.h}`;
+                    if (!seen.has(k)) { seen.add(k); out.push(p); }
+                }
+            }
+        }
+        return out;
+    }
+    if (typeof s !== "string") return [];
+    let txt = s.trim().toLowerCase();
+    if (!txt || txt === "*" || txt === "any" || txt === "auto" || txt === "all") return [];
+    // 正则直接抓 "数字 [x|*|×] 数字" 模式, 不依赖分隔符
+    const out = [];
+    const seen = new Set();
+    const re = /(\d+)\s*[x*×]\s*(\d+)/g;
+    let m;
+    while ((m = re.exec(txt)) !== null) {
+        const w = parseInt(m[1]) | 0, h = parseInt(m[2]) | 0;
+        if (w <= 0 || h <= 0) continue;
+        const k = `${w}x${h}`;
+        if (!seen.has(k)) { seen.add(k); out.push({w, h}); }
+    }
+    return out;
+}
+function formatResolutionList(pairs) {
+    if (!pairs || !pairs.length) return "";
+    return pairs.map(p => `${p.w}x${p.h}`).join(";");
+}
+function matchAnyResolution(w, h, list) {
+    if (!list || !list.length) return true;
+    for (const p of list) if (p.w === w && p.h === h) return true;
+    return false;
+}
+function getTargetResolutionList(node) {
+    return parseResolutionList(getWidget(node, "target_resolution")?.value || "");
 }
 
 // 递归找所有 LoadImage 节点（含 subgraph 内）
@@ -149,12 +203,14 @@ async function pickVideoDialog(node, title) {
         return null;
     }
 
-    // 取本节点 target_resolution 用于标记 / 默认过滤
-    const targetRes = (getWidget(node, "target_resolution")?.value || "1920x1088").trim();
-    const m = targetRes.match(/(\d+)\s*[xX*×]\s*(\d+)/);
-    const tw = m ? parseInt(m[1]) : 0;
-    const th = m ? parseInt(m[2]) : 0;
-    const isTarget = (v) => tw && th && v.width === tw && v.height === th;
+    // 取本节点 target_resolution 用于标记 / 默认过滤 (现在支持多分辨率白名单)
+    const allowList = getTargetResolutionList(node);
+    const isTarget = (v) => matchAnyResolution(v.width, v.height, allowList);
+    const allowLabel = allowList.length === 0
+        ? "(任意)"
+        : (allowList.length === 1
+            ? formatResolutionList(allowList)
+            : `${allowList.length} 种 (${formatResolutionList(allowList)})`);
 
     return new Promise((resolve) => {
         const overlay = document.createElement("div");
@@ -183,7 +239,10 @@ async function pickVideoDialog(node, title) {
         filterCb.checked = false;
         const filterLbl = document.createElement("label");
         filterLbl.htmlFor = filterCb.id;
-        filterLbl.textContent = ` 只看 ${targetRes}`;
+        filterLbl.textContent = ` 只看目标分辨率: ${allowLabel}`;
+        filterLbl.title = allowList.length
+            ? `白名单:\n${allowList.map(p => `  · ${p.w}x${p.h}`).join("\n")}\n\n(在节点上修改 target_resolution 改这个列表)`
+            : "当前没有设置目标分辨率白名单 (留空 = 任意), 勾上无效果";
         filterLbl.style.cssText = "color:#bcb;cursor:pointer;user-select:none;";
         toolbar.appendChild(filterCb);
         toolbar.appendChild(filterLbl);
@@ -324,19 +383,12 @@ async function createLink(srcPath) {
 // 尾帧模式：抽某段视频的最后一帧 → 覆盖写入 input/<dstFilename>
 //
 // 两种调用：
-//   ① 不传 explicitVideoPath → 后端按 since_timestamp + target_resolution 自动找最新匹配
+//   ① 不传 explicitVideoPath → 后端按 since_timestamp + target_resolutions 自动找最新匹配
 //   ② 传 explicitVideoPath → 直接用指定视频 (用于「选视频抽尾帧」「上一对」回退)
 async function extractTailFrameToSlot(node, dstFilename, sinceTimestamp, explicitVideoPath = "") {
-    const targetRes = (getWidget(node, "target_resolution")?.value || "1920x1088").trim();
+    const targetResStr = (getWidget(node, "target_resolution")?.value || "").trim();
     const outDir = (getWidget(node, "output_dir")?.value || "").trim();
-
-    // 解析 "1920x1088" / "1920*1088" / "1920×1088"
-    const m = targetRes.match(/(\d+)\s*[xX*×]\s*(\d+)/);
-    if (!m && !explicitVideoPath) {
-        return { ok: false, error: `target_resolution 格式无效: ${targetRes}（应为 "1920x1088" 这种）` };
-    }
-    const tw = m ? parseInt(m[1]) : 0;
-    const th = m ? parseInt(m[2]) : 0;
+    const allowList = parseResolutionList(targetResStr);
 
     try {
         const res = await fetch(ENDPOINT_TAIL, {
@@ -344,8 +396,8 @@ async function extractTailFrameToSlot(node, dstFilename, sinceTimestamp, explici
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 output_dir: outDir,
-                target_width: tw,
-                target_height: th,
+                // 新字段: 多分辨率白名单. 空 = 任意分辨率, 不过滤
+                target_resolutions: allowList.map(p => [p.w, p.h]),
                 since_timestamp: sinceTimestamp || 0,
                 dst_filename: dstFilename,
                 video_path: explicitVideoPath || "",
@@ -359,11 +411,9 @@ async function extractTailFrameToSlot(node, dstFilename, sinceTimestamp, explici
 
 // 视频历史相关 API
 async function registerLastVideo(node, segmentIndex, firstFilename, lastFilename) {
-    const targetRes = (getWidget(node, "target_resolution")?.value || "1920x1088").trim();
+    const targetResStr = (getWidget(node, "target_resolution")?.value || "").trim();
     const outDir = (getWidget(node, "output_dir")?.value || "").trim();
-    const m = targetRes.match(/(\d+)\s*[xX*×]\s*(\d+)/);
-    const tw = m ? parseInt(m[1]) : 1920;
-    const th = m ? parseInt(m[2]) : 1088;
+    const allowList = parseResolutionList(targetResStr);
 
     // 默认开启分辨率过滤 (用来过滤掉一次工作流里同时输出的预览版),
     // 用户可在 widget "register_only_target_res" 上关掉
@@ -379,8 +429,7 @@ async function registerLastVideo(node, segmentIndex, firstFilename, lastFilename
             body: JSON.stringify({
                 controller_id: String(node.id),
                 output_dir: outDir,
-                target_width: tw,
-                target_height: th,
+                target_resolutions: allowList.map(p => [p.w, p.h]),
                 since_timestamp: node._sessionStartTime || 0,
                 segment_index: segmentIndex,
                 first_filename: firstFilename || "",
@@ -682,6 +731,472 @@ async function applyForCurrentMode(node, opts = {}) {
     return applyCurrentPair(node);
 }
 
+// ---------- 📐 编辑目标分辨率(白名单)弹窗 ----------
+//
+// 给 target_resolution widget 配的可视化编辑器: chip 增删, 确定后写回 widget。
+
+function editTargetResolutionsDialog(node) {
+    return new Promise((resolve) => {
+        const cur = parseResolutionList(getWidget(node, "target_resolution")?.value || "");
+        const list = cur.slice();  // 工作副本
+
+        const overlay = document.createElement("div");
+        overlay.style.cssText = `position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:9999;display:flex;align-items:center;justify-content:center;`;
+        const dlg = document.createElement("div");
+        dlg.style.cssText = `background:#2a2a2a;color:#fff;padding:20px;border-radius:8px;border:1px solid #555;min-width:480px;max-width:90vw;max-height:80vh;overflow:hidden;display:flex;flex-direction:column;font-family:sans-serif;font-size:13px;`;
+
+        const h = document.createElement("h3");
+        h.textContent = "📐 编辑目标分辨率(白名单)";
+        h.style.cssText = "margin:0 0 6px 0;font-size:15px;";
+        dlg.appendChild(h);
+
+        const sub = document.createElement("div");
+        sub.innerHTML =
+            "登记视频时只保留这些分辨率 (过滤一次工作流中同时输出的预览版)。<br>" +
+            "<b style=\"color:#9cc\">留空 / * / auto = 任意分辨率 (取最新视频, 不过滤)</b>";
+        sub.style.cssText = "color:#aaa;font-size:11px;margin-bottom:10px;line-height:1.5;";
+        dlg.appendChild(sub);
+
+        // chip 容器
+        const chipBox = document.createElement("div");
+        chipBox.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;padding:8px;background:#1f1f1f;border:1px solid #444;border-radius:4px;min-height:42px;margin-bottom:10px;";
+        dlg.appendChild(chipBox);
+
+        const renderChips = () => {
+            chipBox.innerHTML = "";
+            if (list.length === 0) {
+                const empty = document.createElement("span");
+                empty.textContent = "(空 — 等同于不过滤, 任意分辨率都收)";
+                empty.style.cssText = "color:#888;font-style:italic;padding:4px 8px;";
+                chipBox.appendChild(empty);
+                return;
+            }
+            list.forEach((p, idx) => {
+                const chip = document.createElement("span");
+                chip.style.cssText = "display:inline-flex;align-items:center;gap:4px;padding:4px 8px;background:#3a4a3a;border:1px solid #4a6a4a;border-radius:14px;font-family:monospace;font-size:12px;";
+                const txt = document.createElement("span");
+                txt.textContent = `${p.w}×${p.h}`;
+                chip.appendChild(txt);
+                const x = document.createElement("button");
+                x.textContent = "×";
+                x.title = "删除";
+                x.style.cssText = "background:none;border:none;color:#fcc;cursor:pointer;font-size:14px;line-height:1;padding:0 2px;";
+                x.onclick = () => { list.splice(idx, 1); renderChips(); };
+                chip.appendChild(x);
+                chipBox.appendChild(chip);
+            });
+        };
+        renderChips();
+
+        // 输入区
+        const inputRow = document.createElement("div");
+        inputRow.style.cssText = "display:flex;gap:6px;margin-bottom:10px;";
+        const wInp = document.createElement("input");
+        wInp.type = "number";
+        wInp.placeholder = "宽 (如 1920)";
+        wInp.style.cssText = "flex:1;padding:6px 8px;background:#1a1a1a;color:#fff;border:1px solid #444;border-radius:3px;font-size:13px;";
+        const xLab = document.createElement("span");
+        xLab.textContent = "×";
+        xLab.style.cssText = "align-self:center;color:#888;font-size:16px;";
+        const hInp = document.createElement("input");
+        hInp.type = "number";
+        hInp.placeholder = "高 (如 1088)";
+        hInp.style.cssText = wInp.style.cssText;
+        const addBtn = document.createElement("button");
+        addBtn.textContent = "➕ 添加";
+        addBtn.style.cssText = "padding:6px 14px;background:#2a5a2a;color:#fff;border:1px solid #4a7a4a;border-radius:3px;cursor:pointer;font-size:13px;";
+        addBtn.onclick = () => {
+            const w = parseInt(wInp.value) | 0, h = parseInt(hInp.value) | 0;
+            if (w <= 0 || h <= 0) { alert("请输入有效的宽和高"); return; }
+            if (list.find(p => p.w === w && p.h === h)) { alert(`${w}×${h} 已在列表里`); return; }
+            list.push({w, h});
+            wInp.value = ""; hInp.value = "";
+            renderChips();
+            wInp.focus();
+        };
+        wInp.addEventListener("keydown", (e) => { if (e.key === "Enter") hInp.focus(); });
+        hInp.addEventListener("keydown", (e) => { if (e.key === "Enter") addBtn.click(); });
+        inputRow.appendChild(wInp);
+        inputRow.appendChild(xLab);
+        inputRow.appendChild(hInp);
+        inputRow.appendChild(addBtn);
+        dlg.appendChild(inputRow);
+
+        // 预设快捷
+        const presets = [
+            { label: "1920×1088", w: 1920, h: 1088 },
+            { label: "1088×1920", w: 1088, h: 1920 },
+            { label: "544×960",   w: 544,  h: 960  },
+            { label: "960×544",   w: 960,  h: 544  },
+            { label: "1280×720",  w: 1280, h: 720  },
+            { label: "720×1280",  w: 720,  h: 1280 },
+            { label: "1024×1024", w: 1024, h: 1024 },
+            { label: "832×480",   w: 832,  h: 480  },
+            { label: "480×832",   w: 480,  h: 832  },
+        ];
+        const presetRow = document.createElement("div");
+        presetRow.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;";
+        const presetLabel = document.createElement("span");
+        presetLabel.textContent = "快捷预设: ";
+        presetLabel.style.cssText = "color:#888;font-size:11px;align-self:center;margin-right:4px;";
+        presetRow.appendChild(presetLabel);
+        presets.forEach(p => {
+            const b = document.createElement("button");
+            b.textContent = p.label;
+            b.style.cssText = "padding:3px 8px;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;cursor:pointer;font-size:11px;font-family:monospace;";
+            b.onmouseenter = () => b.style.background = "#444";
+            b.onmouseleave = () => b.style.background = "#333";
+            b.onclick = () => {
+                if (list.find(it => it.w === p.w && it.h === p.h)) return;
+                list.push({w: p.w, h: p.h});
+                renderChips();
+            };
+            presetRow.appendChild(b);
+        });
+        dlg.appendChild(presetRow);
+
+        // 底部按钮
+        const btnBar = document.createElement("div");
+        btnBar.style.cssText = "display:flex;gap:8px;margin-top:6px;";
+        const clearBtn = document.createElement("button");
+        clearBtn.textContent = "🗑 清空 (= 任意分辨率)";
+        clearBtn.style.cssText = "padding:8px 12px;background:#5a4a2a;color:#fff;border:1px solid #7a6a4a;border-radius:4px;cursor:pointer;";
+        clearBtn.onclick = () => { list.length = 0; renderChips(); };
+        btnBar.appendChild(clearBtn);
+
+        const spacer = document.createElement("div");
+        spacer.style.flex = "1";
+        btnBar.appendChild(spacer);
+
+        const cancel = document.createElement("button");
+        cancel.textContent = "取消";
+        cancel.style.cssText = "padding:8px 14px;background:#5a2a2a;color:#fff;border:1px solid #7a4a4a;border-radius:4px;cursor:pointer;";
+        cancel.onclick = () => { document.body.removeChild(overlay); resolve(null); };
+        btnBar.appendChild(cancel);
+
+        const ok = document.createElement("button");
+        ok.textContent = "✅ 确定";
+        ok.style.cssText = "padding:8px 16px;background:#2a5a2a;color:#fff;border:1px solid #4a7a4a;border-radius:4px;cursor:pointer;font-weight:bold;";
+        ok.onclick = () => {
+            const v = formatResolutionList(list);
+            setWidgetValue(node, "target_resolution", v);
+            document.body.removeChild(overlay);
+            resolve(v);
+        };
+        btnBar.appendChild(ok);
+
+        dlg.appendChild(btnBar);
+        overlay.appendChild(dlg);
+        overlay.onclick = (e) => { if (e.target === overlay) { document.body.removeChild(overlay); resolve(null); } };
+        document.body.appendChild(overlay);
+        setTimeout(() => wInp.focus(), 50);
+    });
+}
+
+// ---------- 📖 提示词手册 ----------
+
+async function apiPromptsList(search = "", tag = "") {
+    try {
+        const res = await fetch(ENDPOINT_PROMPTS_LIST, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ search, tag }),
+        });
+        return await res.json();
+    } catch (e) { return { ok: false, error: String(e), prompts: [] }; }
+}
+async function apiPromptsSave(payload) {
+    try {
+        const res = await fetch(ENDPOINT_PROMPTS_SAVE, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        });
+        return await res.json();
+    } catch (e) { return { ok: false, error: String(e) }; }
+}
+async function apiPromptsDelete(payload) {
+    try {
+        const res = await fetch(ENDPOINT_PROMPTS_DELETE, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        });
+        return await res.json();
+    } catch (e) { return { ok: false, error: String(e) }; }
+}
+
+function _copyText(txt) {
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            return navigator.clipboard.writeText(txt);
+        }
+    } catch (e) {}
+    // 兜底: textarea + execCommand
+    const ta = document.createElement("textarea");
+    ta.value = txt;
+    ta.style.cssText = "position:fixed;left:-9999px;";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(ta);
+    return Promise.resolve();
+}
+
+function _toast(text, parent) {
+    const t = document.createElement("div");
+    t.textContent = text;
+    t.style.cssText = "position:absolute;left:50%;top:14px;transform:translateX(-50%);background:#2a4a2a;color:#cfc;padding:6px 14px;border-radius:14px;font-size:12px;border:1px solid #4a7a4a;z-index:10;box-shadow:0 2px 8px rgba(0,0,0,0.4);";
+    parent.appendChild(t);
+    setTimeout(() => { try { parent.removeChild(t); } catch(e) {} }, 1600);
+}
+
+async function openPromptBookDialog() {
+    const overlay = document.createElement("div");
+    overlay.style.cssText = `position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:9999;display:flex;align-items:center;justify-content:center;`;
+    const dlg = document.createElement("div");
+    dlg.style.cssText = `position:relative;background:#2a2a2a;color:#fff;padding:18px;border-radius:8px;border:1px solid #555;width:880px;max-width:94vw;height:78vh;max-height:78vh;display:flex;flex-direction:column;font-family:sans-serif;font-size:13px;`;
+
+    const header = document.createElement("div");
+    header.style.cssText = "display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;";
+    const h = document.createElement("h3");
+    h.textContent = "📖 提示词手册";
+    h.style.cssText = "margin:0;font-size:16px;";
+    header.appendChild(h);
+    const closeX = document.createElement("button");
+    closeX.textContent = "✕";
+    closeX.title = "关闭";
+    closeX.style.cssText = "background:none;border:none;color:#aaa;cursor:pointer;font-size:18px;padding:0 6px;";
+    closeX.onclick = () => { document.body.removeChild(overlay); };
+    header.appendChild(closeX);
+    dlg.appendChild(header);
+
+    const sub = document.createElement("div");
+    sub.textContent = "保存常用 prompt, 一键复制到剪贴板再粘贴到 prompt 节点。数据存在 ComfyUI/user/auto_sequential_prompts.json。";
+    sub.style.cssText = "color:#888;font-size:11px;margin-bottom:8px;line-height:1.5;";
+    dlg.appendChild(sub);
+
+    // 工具栏: 搜索 + 新增
+    const toolbar = document.createElement("div");
+    toolbar.style.cssText = "display:flex;gap:8px;margin-bottom:8px;";
+    const searchInp = document.createElement("input");
+    searchInp.placeholder = "🔍 搜索标题 / 内容 / tag (Enter 确认)";
+    searchInp.style.cssText = "flex:1;padding:6px 10px;background:#1a1a1a;color:#fff;border:1px solid #444;border-radius:3px;font-size:13px;";
+    toolbar.appendChild(searchInp);
+    const newBtn = document.createElement("button");
+    newBtn.textContent = "➕ 新建";
+    newBtn.style.cssText = "padding:6px 14px;background:#2a5a2a;color:#fff;border:1px solid #4a7a4a;border-radius:3px;cursor:pointer;font-size:13px;";
+    toolbar.appendChild(newBtn);
+    dlg.appendChild(toolbar);
+
+    // 主体: 左列表 + 右编辑
+    const body = document.createElement("div");
+    body.style.cssText = "flex:1;display:flex;gap:10px;overflow:hidden;";
+    dlg.appendChild(body);
+
+    const leftPane = document.createElement("div");
+    leftPane.style.cssText = "width:280px;display:flex;flex-direction:column;border:1px solid #444;border-radius:4px;background:#1f1f1f;overflow:hidden;";
+    body.appendChild(leftPane);
+
+    const listWrap = document.createElement("div");
+    listWrap.style.cssText = "flex:1;overflow-y:auto;padding:4px;";
+    leftPane.appendChild(listWrap);
+
+    const rightPane = document.createElement("div");
+    rightPane.style.cssText = "flex:1;display:flex;flex-direction:column;border:1px solid #444;border-radius:4px;background:#1f1f1f;padding:10px;overflow:hidden;";
+    body.appendChild(rightPane);
+
+    // 右侧编辑表单
+    const editIdHidden = { value: "" };
+
+    const titleLabel = document.createElement("label");
+    titleLabel.textContent = "标题";
+    titleLabel.style.cssText = "color:#aaa;font-size:11px;margin-bottom:2px;";
+    rightPane.appendChild(titleLabel);
+    const titleInp = document.createElement("input");
+    titleInp.placeholder = "比如: 电影感运镜 / 卡通画风 / 雨天氛围";
+    titleInp.style.cssText = "padding:6px 10px;background:#2a2a2a;color:#fff;border:1px solid #444;border-radius:3px;font-size:13px;margin-bottom:8px;";
+    rightPane.appendChild(titleInp);
+
+    const tagsLabel = document.createElement("label");
+    tagsLabel.textContent = "标签 (逗号或空格分隔)";
+    tagsLabel.style.cssText = "color:#aaa;font-size:11px;margin-bottom:2px;";
+    rightPane.appendChild(tagsLabel);
+    const tagsInp = document.createElement("input");
+    tagsInp.placeholder = "video, cinematic, slow-mo";
+    tagsInp.style.cssText = titleInp.style.cssText;
+    rightPane.appendChild(tagsInp);
+
+    const contentLabel = document.createElement("label");
+    contentLabel.textContent = "内容 (Prompt 正文)";
+    contentLabel.style.cssText = "color:#aaa;font-size:11px;margin-bottom:2px;";
+    rightPane.appendChild(contentLabel);
+    const contentArea = document.createElement("textarea");
+    contentArea.placeholder = "粘贴或编辑 prompt 正文...";
+    contentArea.style.cssText = "flex:1;padding:8px 10px;background:#2a2a2a;color:#fff;border:1px solid #444;border-radius:3px;font-size:13px;font-family:'Consolas','Menlo',monospace;resize:none;line-height:1.5;margin-bottom:8px;";
+    rightPane.appendChild(contentArea);
+
+    // 右下操作按钮
+    const editBtnBar = document.createElement("div");
+    editBtnBar.style.cssText = "display:flex;gap:6px;";
+    const copyBtn = document.createElement("button");
+    copyBtn.textContent = "📋 复制内容";
+    copyBtn.style.cssText = "padding:6px 12px;background:#2a4a5a;color:#fff;border:1px solid #4a6a7a;border-radius:3px;cursor:pointer;font-size:12px;";
+    editBtnBar.appendChild(copyBtn);
+
+    const saveBtn = document.createElement("button");
+    saveBtn.textContent = "💾 保存";
+    saveBtn.style.cssText = "padding:6px 14px;background:#2a5a2a;color:#fff;border:1px solid #4a7a4a;border-radius:3px;cursor:pointer;font-size:12px;font-weight:bold;";
+    editBtnBar.appendChild(saveBtn);
+
+    const delBtn = document.createElement("button");
+    delBtn.textContent = "🗑 删除";
+    delBtn.style.cssText = "padding:6px 12px;background:#5a2a2a;color:#fff;border:1px solid #7a4a4a;border-radius:3px;cursor:pointer;font-size:12px;";
+    editBtnBar.appendChild(delBtn);
+
+    const resetBtn = document.createElement("button");
+    resetBtn.textContent = "↺ 清空表单";
+    resetBtn.style.cssText = "padding:6px 12px;background:#3a3a3a;color:#ccc;border:1px solid #555;border-radius:3px;cursor:pointer;font-size:12px;";
+    editBtnBar.appendChild(resetBtn);
+
+    rightPane.appendChild(editBtnBar);
+
+    // ---- 数据 + 渲染 ----
+    let prompts = [];
+
+    function clearForm() {
+        editIdHidden.value = "";
+        titleInp.value = "";
+        contentArea.value = "";
+        tagsInp.value = "";
+        titleInp.focus();
+        renderList();  // 让左侧 active 状态清掉
+    }
+
+    function fillForm(p) {
+        editIdHidden.value = p.id || "";
+        titleInp.value = p.title || "";
+        contentArea.value = p.content || "";
+        tagsInp.value = (p.tags || []).join(", ");
+        renderList();
+    }
+
+    function renderList() {
+        listWrap.innerHTML = "";
+        if (prompts.length === 0) {
+            const empty = document.createElement("div");
+            empty.textContent = "(还没有条目, 点 ➕ 新建)";
+            empty.style.cssText = "color:#888;text-align:center;padding:20px;font-size:12px;";
+            listWrap.appendChild(empty);
+            return;
+        }
+        prompts.forEach((p) => {
+            const item = document.createElement("div");
+            const isActive = (p.id === editIdHidden.value);
+            item.style.cssText = `padding:8px 10px;margin:3px 0;border-radius:3px;cursor:pointer;border:1px solid ${isActive ? '#5a7a5a' : '#333'};background:${isActive ? '#2a3a2a' : '#252525'};`;
+            item.onmouseenter = () => { if (!isActive) item.style.background = "#2f2f2f"; };
+            item.onmouseleave = () => { if (!isActive) item.style.background = "#252525"; };
+
+            const t = document.createElement("div");
+            t.textContent = p.title || "(无标题)";
+            t.style.cssText = "color:#eee;font-weight:bold;font-size:13px;margin-bottom:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+            item.appendChild(t);
+
+            const c = document.createElement("div");
+            c.textContent = (p.content || "").slice(0, 60).replace(/\n/g, " ") + ((p.content || "").length > 60 ? "..." : "");
+            c.style.cssText = "color:#888;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+            item.appendChild(c);
+
+            if (p.tags && p.tags.length) {
+                const tg = document.createElement("div");
+                tg.style.cssText = "margin-top:4px;display:flex;gap:3px;flex-wrap:wrap;";
+                p.tags.slice(0, 4).forEach(t => {
+                    const tn = document.createElement("span");
+                    tn.textContent = t;
+                    tn.style.cssText = "background:#3a3a4a;color:#bbc;padding:1px 6px;border-radius:8px;font-size:10px;";
+                    tg.appendChild(tn);
+                });
+                item.appendChild(tg);
+            }
+
+            item.onclick = () => fillForm(p);
+            listWrap.appendChild(item);
+        });
+    }
+
+    async function reload() {
+        const r = await apiPromptsList(searchInp.value.trim(), "");
+        if (!r.ok) {
+            alert("读取失败: " + (r.error || "?"));
+            return;
+        }
+        prompts = r.prompts || [];
+        renderList();
+    }
+
+    // 事件
+    newBtn.onclick = clearForm;
+    resetBtn.onclick = clearForm;
+
+    saveBtn.onclick = async () => {
+        const title = titleInp.value.trim();
+        const content = contentArea.value;
+        const tags = tagsInp.value;
+        if (!title && !content.trim()) {
+            alert("标题和内容不能同时为空");
+            return;
+        }
+        const r = await apiPromptsSave({
+            id: editIdHidden.value || "",
+            title, content, tags,
+        });
+        if (!r.ok) { alert("保存失败: " + (r.error || "?")); return; }
+        editIdHidden.value = r.prompt?.id || editIdHidden.value;
+        _toast(r.created ? "✓ 已新增" : "✓ 已保存", dlg);
+        await reload();
+        // 重新高亮当前编辑
+        renderList();
+    };
+
+    delBtn.onclick = async () => {
+        if (!editIdHidden.value) {
+            // 没选中也允许清空全部
+            if (!confirm("当前未选中任何条目。是否清空全部提示词?")) return;
+            const r = await apiPromptsDelete({ all: true });
+            if (!r.ok) { alert("清空失败: " + (r.error || "?")); return; }
+            _toast(`✓ 已清空 ${r.deleted} 条`, dlg);
+            clearForm();
+            await reload();
+            return;
+        }
+        if (!confirm(`确定删除「${titleInp.value || "(无标题)"}」?`)) return;
+        const r = await apiPromptsDelete({ id: editIdHidden.value });
+        if (!r.ok) { alert("删除失败: " + (r.error || "?")); return; }
+        _toast("✓ 已删除", dlg);
+        clearForm();
+        await reload();
+    };
+
+    copyBtn.onclick = async () => {
+        if (!contentArea.value) { _toast("内容为空,没东西可复制", dlg); return; }
+        await _copyText(contentArea.value);
+        _toast("✓ 已复制到剪贴板", dlg);
+    };
+
+    let searchTimer = null;
+    searchInp.oninput = () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => reload(), 220);
+    };
+    searchInp.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { clearTimeout(searchTimer); reload(); }
+    });
+
+    overlay.appendChild(dlg);
+    overlay.onclick = (e) => { if (e.target === overlay) document.body.removeChild(overlay); };
+    document.body.appendChild(overlay);
+
+    await reload();
+    setTimeout(() => searchInp.focus(), 50);
+}
+
 // ---------- 注册 ----------
 
 app.registerExtension({
@@ -807,6 +1322,22 @@ app.registerExtension({
                 } else {
                     alert("清空失败: " + (r.error || "?"));
                 }
+            });
+
+            this.addWidget("button", "📐 编辑目标分辨率(白名单)", null, async () => {
+                const v = await editTargetResolutionsDialog(this);
+                if (v !== null) {
+                    const cnt = parseResolutionList(v).length;
+                    updateStatus(this,
+                        cnt === 0
+                            ? "📐 目标分辨率已清空 (=任意分辨率, 取最新视频)"
+                            : `📐 目标分辨率白名单已更新: ${cnt} 种 [${v}]`
+                    );
+                }
+            });
+
+            this.addWidget("button", "📖 提示词手册", null, async () => {
+                await openPromptBookDialog();
             });
 
             this.addWidget("button", "🔗 (可选) 把目录链接进 input/", null, async () => {

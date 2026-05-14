@@ -170,6 +170,109 @@ def _history_clear(controller_id: str = None):
         _save_history(h)
 
 
+# ==========================================================================
+# 提示词手册 (Prompt Book)
+# ==========================================================================
+# 给用户保存常用 prompt 的小本本: 不绑定 controller, 全局共享。
+# 持久化到 ComfyUI/user/auto_sequential_prompts.json (回退到本插件目录)。
+# 数据结构:
+#   { "prompts": [ {id, title, content, tags:[...], created_at, updated_at}, ... ] }
+# --------------------------------------------------------------------------
+
+_PROMPTS_LOCK = threading.Lock()
+
+
+def _get_prompts_path():
+    try:
+        import folder_paths
+        user_dir = None
+        if hasattr(folder_paths, "get_user_directory"):
+            try:
+                user_dir = folder_paths.get_user_directory()
+            except Exception:
+                user_dir = None
+        if not user_dir:
+            base = getattr(folder_paths, "base_path", None)
+            if base:
+                user_dir = os.path.join(base, "user")
+        if user_dir and os.path.isdir(user_dir):
+            return os.path.join(user_dir, "auto_sequential_prompts.json")
+    except Exception:
+        pass
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        ".auto_sequential_prompts.json")
+
+
+def _load_prompts():
+    path = _get_prompts_path()
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data = data.get("prompts", [])
+        if not isinstance(data, list):
+            return []
+        # 兼容性清理 + 默认字段
+        clean = []
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+            clean.append({
+                "id": str(it.get("id") or ""),
+                "title": str(it.get("title") or ""),
+                "content": str(it.get("content") or ""),
+                "tags": list(it.get("tags") or []),
+                "created_at": float(it.get("created_at") or 0),
+                "updated_at": float(it.get("updated_at") or 0),
+            })
+        return clean
+    except Exception as e:
+        print(f"[AutoSeq] 读取提示词手册失败 (将以空列表启动): {e}")
+        return []
+
+
+def _save_prompts(prompts: list):
+    path = _get_prompts_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"prompts": prompts}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"[AutoSeq] 保存提示词手册失败: {e}")
+
+
+def _new_prompt_id():
+    # 时间戳 + 随机 4 位足够避免本地冲突
+    import random
+    return f"p_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+
+
+def _normalize_tags(tags):
+    if not tags:
+        return []
+    if isinstance(tags, str):
+        # 允许传逗号/空格分隔的字符串
+        import re as _re
+        parts = _re.split(r"[,\s;]+", tags)
+        return [p for p in (s.strip() for s in parts) if p]
+    if isinstance(tags, (list, tuple)):
+        out = []
+        for t in tags:
+            if isinstance(t, str):
+                t = t.strip()
+                if t:
+                    out.append(t)
+        return out
+    return []
+
+
 # ---------- 工具函数 ----------
 
 def _natural_key(s: str):
@@ -244,6 +347,83 @@ def _parse_resolution(s: str):
         return int(parts[0]), int(parts[1])
     except ValueError:
         return (0, 0)
+
+
+def _parse_resolution_list(s):
+    """
+    把多分辨率字符串解析为去重后的 [(w,h), ...]。
+    支持分隔符: ; , 空格 / 换行   (任何非数字/x 的字符都会被当分隔符)
+    支持的写法:
+      "1920x1088"
+      "1920x1088;1088x1920;544x960;960x544"
+      "1920*1088, 1088*1920"
+      ""               → []   (表示「不过滤」)
+      "*" / "any" / "auto" → []   (同上, 显式表达「任意分辨率」)
+
+    入参也可以是 list[str] / list[[w,h]] / list[tuple] 。
+    """
+    out = []
+    seen = set()
+
+    def _add(w, h):
+        if w > 0 and h > 0 and (w, h) not in seen:
+            seen.add((w, h))
+            out.append((w, h))
+
+    # 入参已经是 list / tuple
+    if isinstance(s, (list, tuple)):
+        for item in s:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                try:
+                    _add(int(item[0]), int(item[1]))
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(item, str):
+                out.extend(_parse_resolution_list(item))
+        # 二次去重 (递归可能引入重复)
+        out2 = []
+        seen2 = set()
+        for w, h in out:
+            if (w, h) not in seen2:
+                seen2.add((w, h))
+                out2.append((w, h))
+        return out2
+
+    if not isinstance(s, str):
+        return []
+
+    txt = s.strip().lower()
+    if not txt or txt in ("*", "any", "auto", "all"):
+        return []
+
+    # 用正则直接抓 "数字 [x|*|×] 数字" 模式, 允许中间可空可白
+    # 这样无论用户用 ; , 空格 还是 换行 分隔, 都能抓干净
+    import re as _re
+    for m in _re.finditer(r"(\d+)\s*[x*×]\s*(\d+)", txt):
+        try:
+            _add(int(m.group(1)), int(m.group(2)))
+        except ValueError:
+            continue
+    return out
+
+
+def _format_resolution_list(pairs):
+    """[(1920,1088), (1088,1920)] → '1920x1088;1088x1920'。"""
+    if not pairs:
+        return ""
+    return ";".join(f"{w}x{h}" for w, h in pairs)
+
+
+def _match_any_resolution(w: int, h: int, allow_list):
+    """
+    检查 (w,h) 是否落在白名单 allow_list 内 (allow_list 为空 = 任意分辨率都通过)。
+    """
+    if not allow_list:
+        return True
+    for tw, th in allow_list:
+        if w == tw and h == th:
+            return True
+    return False
 
 
 def _scan_videos(output_dir: str, since_mtime: float = 0.0):
@@ -618,14 +798,14 @@ class AutoSequentialController:
                     "placeholder": "输出视频目录 (留空 = ComfyUI/output/)",
                 }),
                 "target_resolution": ("STRING", {
-                    "default": "1920x1088",
+                    "default": "1920x1088;1088x1920;544x960;960x544",
                     "multiline": False,
-                    "placeholder": "目标分辨率, 如 1920x1088 (用于过滤掉中间预览视频)",
+                    "placeholder": "目标分辨率白名单, 多个用 ; 分隔, 留空/* = 任意分辨率",
                 }),
                 "register_only_target_res": ("BOOLEAN", {
                     "default": True,
-                    "label_on": "登记: 只保留 target_resolution (推荐, 过滤预览版)",
-                    "label_off": "登记: 取最新的视频 (不管分辨率)",
+                    "label_on": "登记: 仅白名单分辨率 (推荐, 过滤预览版)",
+                    "label_off": "登记: 取最新视频 (任意分辨率)",
                 }),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
@@ -1012,11 +1192,22 @@ if _HAS_SERVER:
 
             # ---------- 方式 B: 扫盘自动选 ----------
             output_dir = (data.get("output_dir") or "").strip()
-            try:
-                target_w = int(data.get("target_width") or 1920)
-                target_h = int(data.get("target_height") or 1088)
-            except (TypeError, ValueError):
-                target_w, target_h = 1920, 1088
+
+            # 多分辨率白名单。优先用新字段 target_resolutions (list 或字符串都行),
+            # 没传就回退到老字段 target_width + target_height (单一分辨率)。
+            # 白名单为空 → 任意分辨率 (取最新视频)。
+            allow_list = []
+            if "target_resolutions" in data:
+                allow_list = _parse_resolution_list(data.get("target_resolutions"))
+            else:
+                try:
+                    tw = int(data.get("target_width") or 0)
+                    th = int(data.get("target_height") or 0)
+                except (TypeError, ValueError):
+                    tw, th = 0, 0
+                if tw > 0 and th > 0:
+                    allow_list = [(tw, th)]
+                # tw/th = 0 视为不过滤
             try:
                 since_ts = float(data.get("since_timestamp") or 0)
             except (TypeError, ValueError):
@@ -1054,14 +1245,15 @@ if _HAS_SERVER:
                     "mtime": mtime,
                     "resolution": f"{w}x{h}",
                 })
-                if matched is None and w == target_w and h == target_h:
+                if matched is None and _match_any_resolution(w, h, allow_list):
                     matched = (path, mtime, w, h)
 
             if not matched:
+                allow_label = _format_resolution_list(allow_list) or "(任意)"
                 return web.json_response({
                     "ok": False,
                     "error": (
-                        f"没在最近的视频里找到 {target_w}x{target_h} 分辨率的。"
+                        f"没在最近的视频里找到匹配 [{allow_label}] 的分辨率。"
                         f"前 5 个候选: " +
                         ", ".join(
                             f"{os.path.basename(c['path'])}({c['resolution']})"
@@ -1152,11 +1344,19 @@ if _HAS_SERVER:
                 return web.json_response({"ok": False, "error": "controller_id 为空"})
 
             output_dir = (data.get("output_dir") or "").strip()
-            try:
-                target_w = int(data.get("target_width") or 1920)
-                target_h = int(data.get("target_height") or 1088)
-            except (TypeError, ValueError):
-                target_w, target_h = 1920, 1088
+
+            # 多分辨率白名单。优先用新字段 target_resolutions, 回退到老 target_width/height。
+            allow_list = []
+            if "target_resolutions" in data:
+                allow_list = _parse_resolution_list(data.get("target_resolutions"))
+            else:
+                try:
+                    tw = int(data.get("target_width") or 0)
+                    th = int(data.get("target_height") or 0)
+                except (TypeError, ValueError):
+                    tw, th = 0, 0
+                if tw > 0 and th > 0:
+                    allow_list = [(tw, th)]
             try:
                 since_ts = float(data.get("since_timestamp") or 0)
             except (TypeError, ValueError):
@@ -1189,24 +1389,25 @@ if _HAS_SERVER:
                 })
 
             matched = None
-            if only_target_res:
-                # 严格按 target_resolution 过滤, 找最新匹配
+            if only_target_res and allow_list:
+                # 严格按白名单过滤, 找最新匹配
                 for path, mtime in videos[:20]:
                     w, h = _get_video_resolution(path)
-                    if w == target_w and h == target_h:
+                    if _match_any_resolution(w, h, allow_list):
                         matched = (path, mtime, w, h)
                         break
                 if not matched:
+                    allow_label = _format_resolution_list(allow_list)
                     return web.json_response({
                         "ok": False,
                         "skipped_reason": "no_target_res_match",
                         "error": (
-                            f"未找到 {target_w}x{target_h} 分辨率的最近视频"
-                            f" (本次工作流可能还在跑预览版, 或目标分辨率配错)"
+                            f"未找到白名单 [{allow_label}] 分辨率的最近视频"
+                            f" (本次工作流可能还在跑预览版, 或白名单配错)"
                         ),
                     })
             else:
-                # 不过滤: 直接取 since_timestamp 之后最新的那一个
+                # 不过滤(only_target_res=False 或 白名单为空): 直接取 since_timestamp 之后最新的
                 path, mtime = videos[0]
                 w, h = _get_video_resolution(path)
                 matched = (path, mtime, w, h)
@@ -1460,6 +1661,174 @@ if _HAS_SERVER:
             traceback.print_exc()
             return web.json_response(
                 {"ok": False, "error": f"{type(e).__name__}: {e}", "videos": []},
+                status=200,
+            )
+
+    # ============================================================
+    # 提示词手册接口: 列出 / 保存(新增/更新) / 删除 / 清空
+    # ============================================================
+
+    @PromptServer.instance.routes.post("/auto_sequential/prompts/list")
+    async def _prompts_list_endpoint(request):
+        """
+        列出所有提示词。可选筛选: { "search": "关键词", "tag": "tag名" }
+        响应: { ok, prompts: [...], count }
+        """
+        try:
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            search = str(data.get("search") or "").strip().lower()
+            tag = str(data.get("tag") or "").strip().lower()
+
+            with _PROMPTS_LOCK:
+                prompts = _load_prompts()
+
+            # 按 updated_at 倒序 (最新编辑的排前面)
+            prompts.sort(key=lambda p: p.get("updated_at", 0), reverse=True)
+
+            if search or tag:
+                filtered = []
+                for p in prompts:
+                    if tag:
+                        ptags = [str(t).lower() for t in p.get("tags") or []]
+                        if tag not in ptags:
+                            continue
+                    if search:
+                        hay = (p.get("title", "") + "\n" +
+                               p.get("content", "")).lower()
+                        if search not in hay:
+                            continue
+                    filtered.append(p)
+                prompts = filtered
+
+            return web.json_response({
+                "ok": True,
+                "prompts": prompts,
+                "count": len(prompts),
+                "error": "",
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return web.json_response(
+                {"ok": False, "error": f"{type(e).__name__}: {e}", "prompts": []},
+                status=200,
+            )
+
+    @PromptServer.instance.routes.post("/auto_sequential/prompts/save")
+    async def _prompts_save_endpoint(request):
+        """
+        新增或更新一条提示词。
+        请求体: { id?: str, title: str, content: str, tags?: list|str }
+          - id 为空 → 新增 (后端生成 id)
+          - id 已存在 → 更新对应条目
+        响应: { ok, prompt: {...}, created: bool }
+        """
+        try:
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+
+            pid = str(data.get("id") or "").strip()
+            title = str(data.get("title") or "").strip()
+            content = str(data.get("content") or "")
+            tags = _normalize_tags(data.get("tags"))
+
+            if not title and not content:
+                return web.json_response(
+                    {"ok": False, "error": "title 和 content 不能同时为空"})
+
+            now = time.time()
+            with _PROMPTS_LOCK:
+                prompts = _load_prompts()
+                created = False
+                target = None
+                if pid:
+                    for p in prompts:
+                        if p.get("id") == pid:
+                            target = p
+                            break
+                if target is None:
+                    target = {
+                        "id": pid or _new_prompt_id(),
+                        "title": title,
+                        "content": content,
+                        "tags": tags,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                    prompts.append(target)
+                    created = True
+                else:
+                    target["title"] = title
+                    target["content"] = content
+                    target["tags"] = tags
+                    target["updated_at"] = now
+                _save_prompts(prompts)
+
+            return web.json_response({
+                "ok": True,
+                "prompt": target,
+                "created": created,
+                "error": "",
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return web.json_response(
+                {"ok": False, "error": f"{type(e).__name__}: {e}"},
+                status=200,
+            )
+
+    @PromptServer.instance.routes.post("/auto_sequential/prompts/delete")
+    async def _prompts_delete_endpoint(request):
+        """
+        删除一条 (传 id) 或清空全部 (传 {"all": true})。
+        请求体: { id?: str, all?: bool }
+        响应: { ok, deleted: int, remaining: int }
+        """
+        try:
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+
+            pid = str(data.get("id") or "").strip()
+            clear_all = bool(data.get("all"))
+
+            with _PROMPTS_LOCK:
+                prompts = _load_prompts()
+                before = len(prompts)
+                if clear_all:
+                    prompts = []
+                elif pid:
+                    prompts = [p for p in prompts if p.get("id") != pid]
+                else:
+                    return web.json_response(
+                        {"ok": False, "error": "未指定 id 也未传 all=true"})
+                deleted = before - len(prompts)
+                _save_prompts(prompts)
+
+            return web.json_response({
+                "ok": True,
+                "deleted": deleted,
+                "remaining": len(prompts),
+                "error": "",
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return web.json_response(
+                {"ok": False, "error": f"{type(e).__name__}: {e}"},
                 status=200,
             )
 
